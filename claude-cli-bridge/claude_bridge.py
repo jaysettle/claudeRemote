@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
 Claude CLI Bridge for Open WebUI
-Provides an OpenAI-compatible API that proxies requests to Claude CLI via tmux
+Provides an OpenAI-compatible API that proxies requests to Claude CLI
+Supports persistent sessions per chat thread
 """
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
-import subprocess
+import re
 import tempfile
 import time
 import uuid
 from typing import AsyncGenerator, Optional, Union
-from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 # File upload directory
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "claude_uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+# Session storage directory
+SESSION_DIR = Path(tempfile.gettempdir()) / "claude_sessions"
+SESSION_DIR.mkdir(exist_ok=True)
+SESSION_MAP_FILE = SESSION_DIR / "session_map.json"
 
 # Configure logging
 logging.basicConfig(
@@ -33,12 +39,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude CLI Bridge", version="1.0.0")
+app = FastAPI(title="Claude CLI Bridge", version="1.4.0")
 
 # Configuration
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
-TMUX_SESSION_PREFIX = "claude_cli_"
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))  # 5 minutes default
+
+# In-memory session map: chat_id -> claude_session_id
+session_map: Dict[str, str] = {}
+
+
+def load_session_map():
+    """Load session map from disk."""
+    global session_map
+    try:
+        if SESSION_MAP_FILE.exists():
+            with open(SESSION_MAP_FILE, 'r') as f:
+                session_map = json.load(f)
+            logger.info(f"Loaded {len(session_map)} sessions from disk")
+    except Exception as e:
+        logger.error(f"Error loading session map: {e}")
+        session_map = {}
+
+
+def save_session_map():
+    """Save session map to disk."""
+    try:
+        with open(SESSION_MAP_FILE, 'w') as f:
+            json.dump(session_map, f)
+    except Exception as e:
+        logger.error(f"Error saving session map: {e}")
+
+
+# Load sessions on startup
+load_session_map()
 
 
 # Pydantic models for OpenAI-compatible API
@@ -52,8 +86,7 @@ class ContentPart(BaseModel):
 
 class Message(BaseModel):
     role: str
-    content: Union[str, List[ContentPart]]  # Can be string or list of content parts
-
+    content: Union[str, List[ContentPart]]
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -63,55 +96,88 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 
-def save_base64_file(data_url: str) -> Optional[str]:
-    """Save a base64 data URL to a temp file and return the path"""
-    try:
-        # Parse data URL: data:image/png;base64,xxxxx
-        if not data_url.startswith('data:'):
-            return None
+def get_chat_id(request: Request, messages: List[Message]) -> str:
+    """
+    Generate a unique chat ID from the request.
+    Uses x-request-id header if available, otherwise hashes the first user message.
+    """
+    # Try to get ID from headers (Open WebUI might send this)
+    chat_id = request.headers.get("x-chat-id") or request.headers.get("x-conversation-id")
+    if chat_id:
+        return chat_id
 
-        # Extract mime type and base64 data
+    # Generate ID from first user message hash
+    for msg in messages:
+        if msg.role == "user":
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            # Use first 100 chars to generate a stable ID
+            hash_input = content[:100]
+            return hashlib.md5(hash_input.encode()).hexdigest()[:16]
+
+    # Fallback: generate random ID
+    return str(uuid.uuid4())[:16]
+
+
+def decode_base64_file(data_url: str) -> tuple[Optional[str], Optional[str], Optional[bytes]]:
+    """Decode a base64 data URL and return (mime_type, extension, content_bytes)."""
+    try:
+        if not data_url.startswith('data:'):
+            return None, None, None
+
         header, b64_data = data_url.split(',', 1)
         mime_type = header.split(':')[1].split(';')[0]
 
-        # Determine file extension
         ext_map = {
-            'image/png': '.png',
-            'image/jpeg': '.jpg',
-            'image/jpg': '.jpg',
-            'image/gif': '.gif',
-            'image/webp': '.webp',
-            'application/pdf': '.pdf',
-            'text/plain': '.txt',
-            'text/markdown': '.md',
-            'application/json': '.json',
-            'text/csv': '.csv',
+            'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg',
+            'image/gif': '.gif', 'image/webp': '.webp', 'application/pdf': '.pdf',
+            'text/plain': '.txt', 'text/markdown': '.md',
+            'application/json': '.json', 'text/csv': '.csv',
         }
         ext = ext_map.get(mime_type, '.bin')
-
-        # Save to temp file
-        file_id = str(uuid.uuid4())[:8]
-        file_path = UPLOAD_DIR / f"upload_{file_id}{ext}"
-
-        with open(file_path, 'wb') as f:
-            f.write(base64.b64decode(b64_data))
-
-        logger.info(f"Saved uploaded file to {file_path}")
-        return str(file_path)
+        content = base64.b64decode(b64_data)
+        return mime_type, ext, content
     except Exception as e:
-        logger.error(f"Error saving base64 file: {e}")
-        return None
+        logger.error(f"Error decoding base64 file: {e}")
+        return None, None, None
 
 
-def process_message_content(content: Union[str, List[ContentPart]]) -> tuple[str, List[str]]:
-    """Process message content and extract text and file paths"""
+def process_uploaded_file(data_url: str) -> tuple[Optional[str], Optional[str]]:
+    """Process uploaded file. Returns (text_content, binary_path)."""
+    mime_type, ext, content = decode_base64_file(data_url)
+    if content is None:
+        return None, None
+
+    # Text-based files - return content directly
+    text_mimes = ['text/plain', 'text/markdown', 'text/csv', 'application/json']
+    if mime_type in text_mimes:
+        try:
+            text_content = content.decode('utf-8')
+            logger.info(f"Read text file ({mime_type}): {len(text_content)} chars")
+            return text_content, None
+        except UnicodeDecodeError:
+            logger.warning(f"Could not decode {mime_type} as UTF-8")
+
+    # Binary files - save to disk
+    file_id = str(uuid.uuid4())[:8]
+    file_path = UPLOAD_DIR / f"upload_{file_id}{ext}"
+    with open(file_path, 'wb') as f:
+        f.write(content)
+    logger.info(f"Saved binary file to {file_path}")
+    return None, str(file_path)
+
+
+def process_message_content(content: Union[str, List[ContentPart]]) -> tuple[str, List[str], List[str]]:
+    """Process message content. Returns (text, file_contents, binary_paths)."""
     if isinstance(content, str):
-        return content, []
+        return content, [], []
 
     text_parts = []
-    file_paths = []
+    file_contents = []
+    binary_paths = []
 
     for part in content:
+        url = None
+
         if isinstance(part, dict):
             part_type = part.get('type', '')
             if part_type == 'text':
@@ -119,28 +185,27 @@ def process_message_content(content: Union[str, List[ContentPart]]) -> tuple[str
             elif part_type == 'image_url':
                 image_url = part.get('image_url', {})
                 url = image_url.get('url', '') if isinstance(image_url, dict) else ''
-                if url.startswith('data:'):
-                    file_path = save_base64_file(url)
-                    if file_path:
-                        file_paths.append(file_path)
         elif hasattr(part, 'type'):
             if part.type == 'text' and part.text:
                 text_parts.append(part.text)
             elif part.type == 'image_url' and part.image_url:
                 url = part.image_url.url
-                if url.startswith('data:'):
-                    file_path = save_base64_file(url)
-                    if file_path:
-                        file_paths.append(file_path)
 
-    return ' '.join(text_parts), file_paths
+        if url and url.startswith('data:'):
+            text_content, file_path = process_uploaded_file(url)
+            if text_content:
+                file_contents.append(text_content)
+            elif file_path:
+                binary_paths.append(file_path)
+
+    return ' '.join(text_parts), file_contents, binary_paths
 
 
 class Model(BaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "claude-cli"
+    owned_by: str = "anthropic"
 
 
 class ModelList(BaseModel):
@@ -148,185 +213,99 @@ class ModelList(BaseModel):
     data: List[Model]
 
 
-class TmuxSession:
-    """Manages tmux sessions for Claude CLI"""
+async def find_latest_session_id() -> Optional[str]:
+    """Find the most recent Claude session ID from ~/.claude directory."""
+    try:
+        claude_dir = Path.home() / ".claude" / "projects"
+        if not claude_dir.exists():
+            # Try alternate location
+            claude_dir = Path.home() / ".claude"
 
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.session_name = f"{TMUX_SESSION_PREFIX}{session_id}"
-        self.is_first_request = True
+        if not claude_dir.exists():
+            return None
 
-    async def create_session(self) -> bool:
-        """Create a new tmux session with Claude CLI"""
+        # Look for session files - they might be in subdirectories
+        # Claude stores conversations, we need to find the latest
+        cmd = ["find", str(claude_dir), "-name", "*.json", "-mmin", "-1", "-type", "f"]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+
+        if stdout:
+            files = stdout.decode().strip().split('\n')
+            if files and files[0]:
+                # Extract session ID from filename or path
+                latest_file = files[0]
+                # Session ID might be in the filename or a parent directory
+                match = re.search(r'([a-f0-9-]{36}|[a-f0-9]{32})', latest_file)
+                if match:
+                    return match.group(1)
+
+        return None
+    except Exception as e:
+        logger.error(f"Error finding session ID: {e}")
+        return None
+
+
+async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> tuple[str, Optional[str]]:
+    """
+    Run Claude CLI prompt and return (response, new_session_id).
+    If session_id is provided, resumes that session.
+    """
+    try:
+        # Build command
+        cmd = [CLAUDE_CLI_PATH]
+
+        if session_id:
+            # Resume existing session
+            cmd.extend(["--resume", session_id])
+            logger.info(f"Resuming session: {session_id}")
+
+        cmd.extend(["-p", prompt, "--dangerously-skip-permissions"])
+
+        logger.info(f"Running Claude CLI: {' '.join(cmd[:3])}... --dangerously-skip-permissions")
+        logger.debug(f"Prompt length: {len(prompt)} chars")
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
         try:
-            # Check if session already exists
-            result = await asyncio.create_subprocess_exec(
-                "tmux", "has-session", "-t", self.session_name,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout
             )
-            await result.wait()
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise Exception(f"Claude CLI timed out after {timeout} seconds")
 
-            if result.returncode == 0:
-                logger.info(f"Tmux session {self.session_name} already exists")
-                self.is_first_request = False
-                return True
+        if process.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            # Check if it's a "session not found" error
+            if "session" in error_msg.lower() or "not found" in error_msg.lower():
+                logger.warning(f"Session not found, starting fresh: {error_msg}")
+                # Retry without session
+                return await run_claude_prompt(prompt, session_id=None, timeout=timeout)
+            logger.error(f"Claude CLI error (code {process.returncode}): {error_msg}")
+            raise Exception(f"Claude CLI failed: {error_msg}")
 
-            # Create new session
-            cmd = [
-                "tmux", "new-session", "-d", "-s", self.session_name,
-                CLAUDE_CLI_PATH, "--dangerously-skip-permissions"
-            ]
+        response = stdout.decode().strip()
+        logger.info(f"Got response: {len(response)} chars")
 
-            logger.info(f"Creating tmux session: {' '.join(cmd)}")
-            result = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await result.wait()
+        # Try to find the session ID for this conversation
+        new_session_id = await find_latest_session_id() if not session_id else session_id
 
-            if result.returncode != 0:
-                stderr = await result.stderr.read()
-                raise Exception(f"Failed to create tmux session: {stderr.decode()}")
+        return response, new_session_id
 
-            # Give Claude a moment to initialize
-            await asyncio.sleep(3)
-
-            self.is_first_request = True
-            return True
-
-        except Exception as e:
-            logger.error(f"Error creating tmux session: {e}")
-            return False
-
-    async def send_input(self, text: str) -> bool:
-        """Send text input to the tmux session"""
-        try:
-            # If not first request, use --continue flag
-            if not self.is_first_request:
-                # Send continuation command
-                cmd = [
-                    "tmux", "send-keys", "-t", self.session_name,
-                    f"{CLAUDE_CLI_PATH} --continue --dangerously-skip-permissions", "Enter"
-                ]
-                result = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                await result.wait()
-                await asyncio.sleep(1)
-
-            # Send the actual input text (literal mode)
-            cmd = ["tmux", "send-keys", "-t", self.session_name, "-l", text]
-            result = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await result.wait()
-
-            if result.returncode != 0:
-                stderr = await result.stderr.read()
-                raise Exception(f"Failed to send input text: {stderr.decode()}")
-
-            # Send Enter key separately
-            cmd = ["tmux", "send-keys", "-t", self.session_name, "Enter"]
-            result = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await result.wait()
-
-            if result.returncode != 0:
-                stderr = await result.stderr.read()
-                raise Exception(f"Failed to send Enter: {stderr.decode()}")
-
-            self.is_first_request = False
-            return True
-
-        except Exception as e:
-            logger.error(f"Error sending input to tmux: {e}")
-            return False
-
-    async def capture_output(self, timeout: int = CLAUDE_TIMEOUT) -> str:
-        """Capture output from the tmux session"""
-        try:
-            start_time = time.time()
-
-            # First, capture initial output
-            cmd = ["tmux", "capture-pane", "-t", self.session_name, "-p"]
-            result = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await result.communicate()
-            initial_output = stdout.decode()
-
-            # Wait for output to CHANGE (indicates Claude is processing)
-            last_output = initial_output
-            output_changed = False
-
-            while time.time() - start_time < timeout:
-                await asyncio.sleep(1)
-
-                cmd = ["tmux", "capture-pane", "-t", self.session_name, "-p"]
-                result = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, _ = await result.communicate()
-                current_output = stdout.decode()
-
-                if current_output != initial_output:
-                    output_changed = True
-
-                # Only check for stability after output has changed
-                if output_changed:
-                    if current_output == last_output:
-                        # Output stable - Claude is done
-                        return current_output
-
-                last_output = current_output
-
-            return last_output
-
-        except Exception as e:
-            logger.error(f"Error capturing tmux output: {e}")
-            return ""
-
-    async def close(self):
-        """Close the tmux session"""
-        try:
-            cmd = ["tmux", "kill-session", "-t", self.session_name]
-            result = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            await result.wait()
-            logger.info(f"Closed tmux session {self.session_name}")
-        except Exception as e:
-            logger.error(f"Error closing tmux session: {e}")
-
-
-# Session management
-active_sessions: Dict[str, TmuxSession] = {}
-
-
-def get_or_create_session(session_id: Optional[str] = None) -> TmuxSession:
-    """Get existing session or create a new one"""
-    if not session_id:
-        session_id = str(uuid.uuid4())
-
-    if session_id not in active_sessions:
-        active_sessions[session_id] = TmuxSession(session_id)
-
-    return active_sessions[session_id]
+    except Exception as e:
+        logger.error(f"Error running Claude CLI: {e}")
+        raise
 
 
 # API Endpoints
@@ -335,8 +314,9 @@ def get_or_create_session(session_id: Optional[str] = None) -> TmuxSession:
 async def root():
     return {
         "message": "Claude CLI Bridge API",
-        "version": "1.0.0",
-        "status": "running"
+        "version": "1.2.0",
+        "status": "running",
+        "active_sessions": len(session_map)
     }
 
 
@@ -345,66 +325,99 @@ async def list_models() -> ModelList:
     """List available models (OpenAI-compatible)"""
     return ModelList(
         data=[
-            Model(
-                id="claude-cli",
-                object="model",
-                owned_by="anthropic"
-            )
+            Model(id="claude-cli", object="model", owned_by="anthropic")
         ]
     )
 
 
+@app.get("/sessions")
+async def list_sessions():
+    """List active sessions (debug endpoint)"""
+    return {"sessions": session_map}
+
+
+@app.delete("/sessions/{chat_id}")
+async def delete_session(chat_id: str):
+    """Delete a session mapping"""
+    if chat_id in session_map:
+        del session_map[chat_id]
+        save_session_map()
+        return {"status": "deleted", "chat_id": chat_id}
+    raise HTTPException(status_code=404, detail="Session not found")
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: Request, body: ChatCompletionRequest):
     """Handle chat completion requests (OpenAI-compatible)"""
     try:
-        # Extract the user's message and any file attachments
-        user_message = None
-        file_paths = []
+        # Build conversation history from all messages
+        conversation_history = []
+        current_user_message = None
+        file_contents = []
+        binary_paths = []
 
-        for msg in reversed(request.messages):
+        for msg in body.messages:
+            text, contents, paths = process_message_content(msg.content)
+
+            # Collect file attachments from user messages
             if msg.role == "user":
-                text, files = process_message_content(msg.content)
-                user_message = text
-                file_paths.extend(files)
-                break
+                current_user_message = text
+                file_contents.extend(contents)
+                binary_paths.extend(paths)
 
-        if not user_message and not file_paths:
+            # Build conversation history (skip system messages)
+            if msg.role in ["user", "assistant"] and text:
+                role_label = "User" if msg.role == "user" else "Assistant"
+                conversation_history.append(f"{role_label}: {text}")
+
+        if not current_user_message and not file_contents:
             raise HTTPException(status_code=400, detail="No user message found")
 
-        # If files were uploaded, add them to the message
-        if file_paths:
-            file_references = "\n".join([f"[Attached file: {fp}]" for fp in file_paths])
-            if user_message:
-                user_message = f"{user_message}\n\n{file_references}\n\nPlease read and analyze the attached file(s)."
-            else:
-                user_message = f"{file_references}\n\nPlease read and analyze the attached file(s)."
-            logger.info(f"Processing request with {len(file_paths)} file(s)")
+        # Build the full prompt
+        prompt_parts = []
+
+        # Include conversation history if there's prior context
+        if len(conversation_history) > 1:
+            prompt_parts.append("[Conversation history]")
+            # All messages except the last one (which is the current message)
+            for entry in conversation_history[:-1]:
+                prompt_parts.append(entry)
+            prompt_parts.append("")
+            prompt_parts.append("[Current message]")
+            prompt_parts.append(conversation_history[-1])
+            logger.info(f"Including {len(conversation_history)-1} prior messages in context")
         else:
-            logger.info(f"Processing request: {user_message[:100] if user_message else 'empty'}...")
+            # Single message, no history needed
+            prompt_parts.append(current_user_message or "")
 
-        # Get or create session (using a default session for simplicity)
-        session = get_or_create_session("default")
+        # Add file contents
+        if file_contents:
+            prompt_parts.append("\n--- UPLOADED FILE CONTENT ---")
+            for i, content in enumerate(file_contents, 1):
+                if len(content) > 50000:
+                    content = content[:50000] + "\n\n[... truncated ...]"
+                prompt_parts.append(f"\n[File {i}]:\n```\n{content}\n```")
+            prompt_parts.append("--- END FILE CONTENT ---")
+            logger.info(f"Included {len(file_contents)} text file(s)")
 
-        # Create session if needed
-        if not await session.create_session():
-            raise HTTPException(status_code=500, detail="Failed to create Claude session")
+        if binary_paths:
+            prompt_parts.append("\n--- UPLOADED IMAGES/FILES ---")
+            for i, path in enumerate(binary_paths, 1):
+                prompt_parts.append(f"Please view the image/file at: {path}")
+            prompt_parts.append("--- END UPLOADED FILES ---")
+            logger.info(f"Included {len(binary_paths)} image/binary file(s) for viewing")
 
-        # Send input to Claude
-        if not await session.send_input(user_message):
-            raise HTTPException(status_code=500, detail="Failed to send input to Claude")
+        final_message = "\n".join(prompt_parts)
+        logger.info(f"Processing ({len(conversation_history)} msgs, {len(final_message)} chars): {current_user_message[:50] if current_user_message else 'file only'}...")
 
-        # Capture output
-        output = await session.capture_output()
+        # Run Claude CLI (stateless, context included in prompt)
+        response_text, _ = await run_claude_prompt(final_message)
 
-        if not output:
-            raise HTTPException(status_code=500, detail="No response from Claude")
-
-        # Clean up the output (remove prompts and formatting)
-        response_text = clean_claude_output(output)
+        if not response_text:
+            response_text = "No response generated"
 
         # Return in OpenAI format
-        if request.stream:
+        if body.stream:
             return StreamingResponse(
                 stream_response(response_text),
                 media_type="text/event-stream"
@@ -414,7 +427,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 "id": f"chatcmpl-{uuid.uuid4()}",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": request.model,
+                "model": body.model,
                 "choices": [
                     {
                         "index": 0,
@@ -426,12 +439,14 @@ async def chat_completions(request: ChatCompletionRequest):
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": len(user_message.split()),
+                    "prompt_tokens": len(final_message.split()),
                     "completion_tokens": len(response_text.split()),
-                    "total_tokens": len(user_message.split()) + len(response_text.split())
+                    "total_tokens": len(final_message.split()) + len(response_text.split())
                 }
             }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing chat completion: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -441,7 +456,6 @@ async def stream_response(text: str) -> AsyncGenerator[str, None]:
     """Stream response in OpenAI SSE format"""
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
 
-    # Stream the text word by word
     words = text.split()
     for i, word in enumerate(words):
         chunk = {
@@ -449,137 +463,28 @@ async def stream_response(text: str) -> AsyncGenerator[str, None]:
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": "claude-cli",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "content": word + " " if i < len(words) - 1 else word
-                    },
-                    "finish_reason": None
-                }
-            ]
+            "choices": [{
+                "index": 0,
+                "delta": {"content": word + " " if i < len(words) - 1 else word},
+                "finish_reason": None
+            }]
         }
         yield f"data: {json.dumps(chunk)}\n\n"
-        await asyncio.sleep(0.05)  # Small delay for streaming effect
+        await asyncio.sleep(0.05)
 
-    # Send final chunk
     final_chunk = {
         "id": chunk_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": "claude-cli",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }
-        ]
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
     }
     yield f"data: {json.dumps(final_chunk)}\n\n"
     yield "data: [DONE]\n\n"
-
-
-def clean_claude_output(output: str) -> str:
-    """Clean up Claude CLI output to extract just the response"""
-    import re
-    lines = output.split('\n')
-
-    response_lines = []
-    in_response = False
-    skip_until_next_section = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        # Skip empty lines
-        if not stripped:
-            if in_response and response_lines:
-                response_lines.append('')  # Preserve paragraph breaks
-            continue
-
-        # Skip box drawing characters and UI chrome
-        if any(c in stripped for c in ['╭', '╮', '╯', '╰', '│', '─', '━', '⏵', '├', '└']):
-            continue
-
-        # Skip prompts and commands
-        if stripped.startswith('>') or stripped.startswith('$'):
-            continue
-        if '/usr/local/bin/claude' in stripped or '--dangerously-skip-permissions' in stripped:
-            continue
-
-        # Skip tool invocations and their output
-        if re.match(r'^(Write|Read|Edit|Bash|Glob|Grep|Task|TodoWrite)\s*\(', stripped):
-            skip_until_next_section = True
-            continue
-
-        # Skip status messages
-        if re.match(r'^Retrieved \d+ sources?', stripped):
-            continue
-        if re.match(r'^\[Pasted text #\d+', stripped):
-            continue
-
-        # Skip tips
-        if stripped.lower().startswith('tip:'):
-            continue
-
-        # Skip status/info lines
-        if any(x in stripped.lower() for x in ['bypass permissions', 'auto-update failed',
-               'shift+tab', 'ctrl-g', 'thinking off', 'welcome back', 'opus 4.5',
-               'tips for getting', 'recent activity', 'no recent activity',
-               'run /init', 'processing', 'esc to interrupt', '/terminal-setup',
-               'wrote', 'created', 'updated', 'deleted', 'working as expected',
-               '--continue', '--resume', 'resume a conversation']):
-            continue
-
-        # Skip lines that are just decoration
-        if re.match(r'^[▐▛█▜▌▘▝\s]+$', stripped):
-            continue
-
-        # Claude's actual responses start with ● or ⎿
-        if stripped.startswith('●') or stripped.startswith('⎿'):
-            in_response = True
-            skip_until_next_section = False
-            # Remove the bullet and leading space
-            clean_line = re.sub(r'^[●⎿]\s*', '', stripped)
-            # Skip if it's a tool invocation
-            if not re.match(r'^(Write|Read|Edit|Bash|Glob|Grep|Task|TodoWrite)\s*\(', clean_line):
-                response_lines.append(clean_line)
-        elif in_response and not skip_until_next_section:
-            # Continue capturing multi-line responses
-            # Stop if we hit another prompt
-            if stripped.startswith('>'):
-                break
-            # Skip tool-related output
-            if not re.match(r'^(Write|Read|Edit|Bash|Glob|Grep|Task|TodoWrite)\s*\(', stripped):
-                response_lines.append(stripped)
-
-    # Join and clean up
-    response = '\n'.join(response_lines).strip()
-
-    # Remove trailing empty lines
-    while response.endswith('\n\n'):
-        response = response[:-1]
-
-    # If still empty, try to extract any meaningful text
-    if not response:
-        # Fallback: look for any text that's not a command or status
-        for line in lines:
-            stripped = line.strip()
-            if stripped and not any(x in stripped for x in ['●', '⎿', '>', '$', '/', 'claude', 'Write(', 'Read(', 'Bash(', 'Tip:']):
-                if len(stripped) > 20 and not stripped.startswith('['):
-                    response = stripped
-                    break
-
-    return response if response else "No response generated"
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up sessions on shutdown"""
-    logger.info("Shutting down, closing all sessions...")
-    for session in active_sessions.values():
-        await session.close()
 
 
 if __name__ == "__main__":
