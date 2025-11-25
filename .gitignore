@@ -1,0 +1,43 @@
+# SSH keys and credentials
+ssh-keys/
+*.key
+*.pem
+
+# Personal documentation (keep locally, not in repo)
+COMPLETE_INSTALLATION.md
+DEPLOYMENT_SUMMARY.md
+ERROR_REPORT.md
+FINAL_SETUP_STEPS.md
+QUICKSTART.md
+claude.md
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# Logs
+*.log
+bridge.log
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temp files
+*.tmp
+*.temp
+
+# Cloned repos
+open-webui/

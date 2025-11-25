@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  claude-bridge:
+    build: .
+    container_name: claude-cli-bridge
+    ports:
+      - "8001:8000"  # Using 8001 to avoid conflict with existing services
+    environment:
+      - CLAUDE_CLI_PATH=/root/.local/bin/claude
+      - CLAUDE_TIMEOUT=300
+    restart: unless-stopped
+    volumes:
+      # Mount Claude CLI config if needed
+      - ./claude-data:/root/.config/claude
+    networks:
+      - claude-openwebui-network
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui-claude
+    ports:
+      - "3001:8080"  # Using 3001 to avoid conflict with existing Open WebUI
+    environment:
+      - OPENAI_API_BASE_URLS=http://YOUR_SERVER_IP:8000/v1
+      - OPENAI_API_KEYS=dummy-key
+    volumes:
+      - open-webui-claude-data:/app/backend/data
+    depends_on:
+      - claude-bridge
+    restart: unless-stopped
+    networks:
+      - claude-openwebui-network
+
+networks:
+  claude-openwebui-network:
+    driver: bridge
+
+volumes:
+  open-webui-claude-data:
