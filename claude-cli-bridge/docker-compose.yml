@@ -24,6 +24,7 @@ services:
     environment:
       - OPENAI_API_BASE_URLS=http://YOUR_SERVER_IP:8000/v1
       - OPENAI_API_KEYS=dummy-key
+      - ENABLE_FORWARD_USER_INFO_HEADERS=true  # Send chat_id to backend
     volumes:
       - open-webui-claude-data:/app/backend/data
     depends_on:
