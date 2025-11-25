@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude CLI Bridge", version="1.4.0")
+app = FastAPI(title="Claude CLI Bridge", version="1.4.1")
 
 # Configuration
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
@@ -314,7 +314,7 @@ async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeo
 async def root():
     return {
         "message": "Claude CLI Bridge API",
-        "version": "1.2.0",
+        "version": app.version,
         "status": "running",
         "active_sessions": len(session_map)
     }
@@ -356,14 +356,21 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         file_contents = []
         binary_paths = []
 
-        for msg in body.messages:
+        # Find the last user message index
+        last_user_idx = -1
+        for i, msg in enumerate(body.messages):
+            if msg.role == "user":
+                last_user_idx = i
+
+        for i, msg in enumerate(body.messages):
             text, contents, paths = process_message_content(msg.content)
 
-            # Collect file attachments from user messages
+            # Only collect file attachments from the LAST user message (current)
             if msg.role == "user":
                 current_user_message = text
-                file_contents.extend(contents)
-                binary_paths.extend(paths)
+                if i == last_user_idx:
+                    file_contents.extend(contents)
+                    binary_paths.extend(paths)
 
             # Build conversation history (skip system messages)
             if msg.role in ["user", "assistant"] and text:
