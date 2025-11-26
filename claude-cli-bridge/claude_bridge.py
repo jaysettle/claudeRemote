@@ -4,7 +4,7 @@ Claude CLI Bridge for Open WebUI
 Provides an OpenAI-compatible API that proxies requests to Claude CLI
 Supports persistent sessions per chat thread
 
-v1.6.0 - Minimal logging
+v1.6.4 - Fix: only use UUID format sessions (agent-* doesn't work with --resume)
 """
 
 import asyncio
@@ -41,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude CLI Bridge", version="1.6.0")
+app = FastAPI(title="Claude CLI Bridge", version="1.6.4")
 
 # Configuration
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
@@ -225,7 +225,7 @@ async def find_latest_session_id() -> Optional[str]:
         if not projects_dir.exists():
             return None
 
-        # Look for recently modified .jsonl files (sessions are stored as UUID.jsonl)
+        # Look for recently modified .jsonl files (UUID format only - agent-* doesn't work with --resume)
         cmd = ["find", str(projects_dir), "-name", "*.jsonl", "-mmin", "-2", "-type", "f"]
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -236,24 +236,27 @@ async def find_latest_session_id() -> Optional[str]:
 
         if stdout:
             files = [f for f in stdout.decode().strip().split('\n') if f]
-            if files:
-                filename = Path(files[0]).stem
-                if re.match(r'^[a-f0-9-]{36}$', filename):
+            # Find first UUID format file (agent-* files don't work with --resume)
+            for filepath in files:
+                filename = Path(filepath).stem
+                if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', filename):
                     return filename
-                # Try to find UUID in the path
-                match = re.search(r'/([a-f0-9-]{36})\.jsonl$', files[0])
-                if match:
-                    return match.group(1)
         return None
     except Exception as e:
         logger.error(f"Error finding session ID: {e}")
         return None
 
 
+class SessionNotFoundError(Exception):
+    """Raised when Claude CLI session is not found."""
+    pass
+
+
 async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> tuple[str, Optional[str]]:
     """
     Run Claude CLI prompt and return (response, new_session_id).
     If session_id is provided, resumes that session.
+    Raises SessionNotFoundError if session doesn't exist (caller should retry with history).
     """
     try:
         cmd = [CLAUDE_CLI_PATH]
@@ -277,16 +280,18 @@ async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeo
         stderr_text = stderr.decode() if stderr else ""
         if process.returncode != 0:
             error_msg = stderr_text or "Unknown error"
-            # Retry without session if session not found
+            # Raise specific exception for session not found - caller will retry with history
             if session_id and ("session" in error_msg.lower() or "not found" in error_msg.lower()):
-                logger.warning(f"Session {session_id} not found, starting new")
-                return await run_claude_prompt(prompt, session_id=None, timeout=timeout)
+                logger.warning(f"Session {session_id[:8]} not found")
+                raise SessionNotFoundError(session_id)
             raise Exception(f"Claude CLI failed: {error_msg}")
 
         response = stdout.decode().strip()
         new_session_id = await find_latest_session_id() if not session_id else session_id
         return response, new_session_id
 
+    except SessionNotFoundError:
+        raise  # Re-raise for caller to handle
     except Exception as e:
         logger.error(f"Claude CLI error: {e}")
         raise
@@ -368,21 +373,27 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         if not current_user_message and not file_contents and not binary_paths:
             raise HTTPException(status_code=400, detail="No user message found")
 
-        # Build the full prompt
-        prompt_parts = []
+        # Build prompts - current only (optimized) and with history (fallback)
+        current_only = current_user_message or ""
 
-        # Include conversation history if there's prior context
+        history_prompt = None
         if len(conversation_history) > 1:
-            prompt_parts.append("[Conversation history]")
-            # All messages except the last one (which is the current message)
+            history_parts = ["[Conversation history]"]
             for entry in conversation_history[:-1]:
-                prompt_parts.append(entry)
-            prompt_parts.append("")
-            prompt_parts.append("[Current message]")
-            prompt_parts.append(conversation_history[-1])
+                history_parts.append(entry)
+            history_parts.append("")
+            history_parts.append("[Current message]")
+            history_parts.append(conversation_history[-1])
+            history_prompt = "\n".join(history_parts)
+
+        # Use current-only when session exists, history when no session
+        prompt_parts = []
+        if claude_session_id:
+            prompt_parts.append(current_only)
+        elif history_prompt:
+            prompt_parts.append(history_prompt)
         else:
-            # Single message, no history needed
-            prompt_parts.append(current_user_message or "")
+            prompt_parts.append(current_only)
 
         # Add file contents
         if file_contents:
@@ -411,12 +422,23 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         if body.stream:
             # Streaming mode - shows thinking indicator while Claude works
             return StreamingResponse(
-                stream_with_thinking(final_message, chat_id, claude_session_id),
+                stream_with_thinking(final_message, chat_id, claude_session_id, history_prompt),
                 media_type="text/event-stream"
             )
         else:
             # Non-streaming mode - wait for full response
-            response_text, new_session_id = await run_claude_prompt(final_message, claude_session_id)
+            try:
+                response_text, new_session_id = await run_claude_prompt(final_message, claude_session_id)
+            except SessionNotFoundError:
+                # Session expired - clear mapping and retry with history
+                if chat_id in session_map:
+                    del session_map[chat_id]
+                    save_session_map()
+                # Rebuild prompt with history and retry
+                fallback_prompt = history_prompt if history_prompt else final_message
+                logger.info(f"Retrying with history after session expired")
+                response_text, new_session_id = await run_claude_prompt(fallback_prompt, session_id=None)
+
             if not response_text:
                 response_text = "No response generated"
             # Save session mapping if this was a new session
@@ -488,7 +510,7 @@ async def stream_response(text: str) -> AsyncGenerator[str, None]:
     yield "data: [DONE]\n\n"
 
 
-async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> AsyncGenerator[str, None]:
+async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[str] = None, history_prompt: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> AsyncGenerator[str, None]:
     """Stream response with thinking indicator while Claude works"""
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
 
@@ -506,65 +528,90 @@ async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[s
         }
 
     # Build Claude CLI command
-    cmd = [CLAUDE_CLI_PATH]
-    if session_id:
-        cmd.extend(["--resume", session_id])
-    cmd.extend(["-p", prompt, "--dangerously-skip-permissions"])
+    current_prompt = prompt
+    current_session = session_id
+    retry_with_history = False
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    # Show thinking indicator while waiting
-    yield f"data: {json.dumps(make_chunk('⏳ '))}\n\n"
-
-    dots = 0
     while True:
-        try:
-            # Check if process is done (wait 2 seconds between dots)
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=2.0
-            )
-            # Process finished - got the response
-            response = stdout.decode().strip()
-            if process.returncode != 0:
-                error_msg = stderr.decode() if stderr else "Unknown error"
-                # Check if it's a session not found error
-                if session_id and ("session" in error_msg.lower() or "not found" in error_msg.lower()):
-                    logger.warning(f"Session {session_id[:8]} not found")
-                response = f"Error: {error_msg}"
+        cmd = [CLAUDE_CLI_PATH]
+        if current_session:
+            cmd.extend(["--resume", current_session])
+        cmd.extend(["-p", current_prompt, "--dangerously-skip-permissions"])
 
-            # Save session mapping if this was a new session
-            if not session_id and chat_id:
-                new_session_id = await find_latest_session_id()
-                if new_session_id:
-                    session_map[chat_id] = new_session_id
-                    save_session_map()
-                    logger.info(f"New session: {new_session_id[:8]}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
 
-            # Clear thinking indicator and send response
-            yield f"data: {json.dumps(make_chunk(chr(8) * (dots + 3)))}\n\n"  # Backspaces
+        # Show thinking indicator while waiting (only on first attempt)
+        if not retry_with_history:
+            yield f"data: {json.dumps(make_chunk('⏳ '))}\n\n"
 
-            # Stream the actual response
-            words = response.split()
-            for i, word in enumerate(words):
-                yield f"data: {json.dumps(make_chunk(word + (' ' if i < len(words) - 1 else '')))}\n\n"
-                await asyncio.sleep(0.02)
+        dots = 0
+        while True:
+            try:
+                # Check if process is done (wait 2 seconds between dots)
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=2.0
+                )
+                # Process finished - got the response
+                response = stdout.decode().strip()
+                if process.returncode != 0:
+                    error_msg = stderr.decode() if stderr else "Unknown error"
+                    # Check if it's a session not found error - retry with history
+                    if current_session and ("session" in error_msg.lower() or "not found" in error_msg.lower()):
+                        logger.warning(f"Session {current_session[:8]} not found")
+                        if history_prompt and not retry_with_history:
+                            # Clear bad session and retry with history
+                            if chat_id in session_map:
+                                del session_map[chat_id]
+                                save_session_map()
+                            logger.info(f"Retrying with history after session expired")
+                            current_prompt = history_prompt
+                            current_session = None
+                            retry_with_history = True
+                            break  # Break inner loop to retry outer loop
+                    response = f"Error: {error_msg}"
 
-            break
+                # Save session mapping if this was a new session
+                if not current_session and chat_id:
+                    new_session_id = await find_latest_session_id()
+                    if new_session_id:
+                        session_map[chat_id] = new_session_id
+                        save_session_map()
+                        logger.info(f"New session: {new_session_id[:8]}")
 
-        except asyncio.TimeoutError:
-            # Still running - add a dot
-            dots += 1
-            yield f"data: {json.dumps(make_chunk('.'))}\n\n"
+                # Clear thinking indicator and send response
+                yield f"data: {json.dumps(make_chunk(chr(8) * (dots + 3)))}\n\n"  # Backspaces
 
-            if dots * 2 > timeout:
-                process.kill()
-                yield f"data: {json.dumps(make_chunk(' (timed out)'))}\n\n"
-                break
+                # Stream the actual response
+                words = response.split()
+                for i, word in enumerate(words):
+                    yield f"data: {json.dumps(make_chunk(word + (' ' if i < len(words) - 1 else '')))}\n\n"
+                    await asyncio.sleep(0.02)
+
+                # Done - exit both loops
+                yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            except asyncio.TimeoutError:
+                # Still running - add a dot
+                dots += 1
+                yield f"data: {json.dumps(make_chunk('.'))}\n\n"
+
+                if dots * 2 > timeout:
+                    process.kill()
+                    yield f"data: {json.dumps(make_chunk(' (timed out)'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+        # If we get here, we're retrying with history
+        if not retry_with_history:
+            break  # Something went wrong, exit
 
     yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
     yield "data: [DONE]\n\n"
