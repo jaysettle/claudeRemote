@@ -121,7 +121,7 @@ Claude CLI Bridge for Open WebUI
 Provides an OpenAI-compatible API that proxies requests to Claude CLI
 Supports persistent sessions per chat thread
 
-v1.6.0 - Minimal logging
+v1.8.1 - TTS configuration, MCP support
 """
 
 import asyncio
@@ -158,7 +158,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude CLI Bridge", version="1.6.0")
+app = FastAPI(title="Claude CLI Bridge", version="1.8.1")
 
 # Configuration
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
@@ -708,7 +708,7 @@ CLAUDE_CLI_PATH=/usr/local/bin/claude python3 claude_bridge.py
 
 # In another terminal:
 curl http://localhost:8000/
-# Should return: {"message":"Claude CLI Bridge API","version":"1.6.0",...}
+# Should return: {"message":"Claude CLI Bridge API","version":"1.8.1",...}
 ```
 
 ---
@@ -752,8 +752,24 @@ curl http://localhost:8000/
 
 ## Phase 5: Open WebUI Docker Setup
 
-### 5.1 Create docker-compose.yml
+### 5.1 Create docker-compose.yml (or run manually)
 ```bash
+# Option 1: Docker run command (recommended)
+docker run -d --name open-webui-claude \
+  -p 3001:8080 \
+  -e OPENAI_API_BASE_URLS=http://YOUR_SERVER_IP:8000/v1 \
+  -e OPENAI_API_KEYS=dummy-key \
+  -e ENABLE_FORWARD_USER_INFO_HEADERS=true \
+  -e AUDIO_TTS_ENGINE=openai \
+  -e AUDIO_TTS_OPENAI_API_BASE_URL=https://api.openai.com/v1 \
+  -e AUDIO_TTS_OPENAI_API_KEY=YOUR_OPENAI_API_KEY \
+  -e AUDIO_TTS_MODEL=tts-1 \
+  -e AUDIO_TTS_VOICE=alloy \
+  -v open-webui-claude-data:/app/backend/data \
+  --restart unless-stopped \
+  ghcr.io/open-webui/open-webui:main
+
+# Option 2: docker-compose.yml
 cat > ~/claude-cli-bridge/docker-compose.yml << 'EOF'
 version: '3.8'
 
@@ -767,6 +783,11 @@ services:
       - OPENAI_API_BASE_URLS=http://YOUR_SERVER_IP:8000/v1
       - OPENAI_API_KEYS=dummy-key
       - ENABLE_FORWARD_USER_INFO_HEADERS=true
+      - AUDIO_TTS_ENGINE=openai
+      - AUDIO_TTS_OPENAI_API_BASE_URL=https://api.openai.com/v1
+      - AUDIO_TTS_OPENAI_API_KEY=YOUR_OPENAI_API_KEY
+      - AUDIO_TTS_MODEL=tts-1
+      - AUDIO_TTS_VOICE=alloy
     volumes:
       - open-webui-claude-data:/app/backend/data
     restart: unless-stopped
@@ -777,6 +798,8 @@ volumes:
   open-webui-claude-data:
 EOF
 ```
+
+**Important TTS Note:** The `AUDIO_TTS_*` environment variables are required for iOS Safari TTS support. Without them, Open WebUI tries to call the Claude Bridge's `/audio/speech` endpoint (which doesn't exist), causing 400 errors.
 
 ### 5.2 Update Server IP
 ```bash
@@ -823,13 +846,93 @@ ssh -i "$env:USERPROFILE\.ssh\id_ed25519_server" jay@SERVER_IP
 
 ---
 
-## Phase 7: Verification Checklist
+## Phase 7: Tailscale Funnel Setup (Optional - Remote Access)
 
-### 7.1 Service Health Checks
+### 7.1 Install Tailscale
+```bash
+# Install Tailscale (snap version)
+sudo snap install tailscale
+
+# Authenticate
+sudo tailscale up
+
+# Verify connection
+tailscale status
+```
+
+### 7.2 Enable Funnel for Open WebUI
+```bash
+# Enable HTTPS funnel to port 3001
+tailscale funnel 3001
+
+# Verify funnel status
+tailscale funnel status
+# Shows: https://YOUR_MACHINE.tail*.ts.net -> http://localhost:3001
+```
+
+### 7.3 Access Remotely
+Your Open WebUI is now accessible at:
+`https://YOUR_MACHINE_NAME.tail*.ts.net`
+
+---
+
+## Phase 8: MCP Server Setup (Optional)
+
+### 8.1 Install npm globally (for MCP servers)
+```bash
+mkdir -p ~/.npm-global
+npm config set prefix '~/.npm-global'
+echo 'export PATH=~/.npm-global/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### 8.2 Add Home Assistant MCP
+```bash
+claude mcp add hass-mcp -s user \
+  -e HA_URL=http://YOUR_HA_IP:8123 \
+  -e HA_TOKEN=YOUR_LONG_LIVED_TOKEN \
+  -- docker run -i --rm -e HA_URL -e HA_TOKEN voska/hass-mcp
+```
+
+### 8.3 Add Google Drive MCP
+```bash
+# Install the MCP server
+npm install -g @piotr-agier/google-drive-mcp
+
+# Copy your Google OAuth credentials to server
+# (Create OAuth 2.0 Desktop App credentials in Google Cloud Console)
+mkdir -p ~/.config
+# Copy credentials JSON to ~/.config/google-drive-mcp-credentials.json
+
+# Run OAuth authentication
+export GOOGLE_DRIVE_OAUTH_CREDENTIALS=~/.config/google-drive-mcp-credentials.json
+google-drive-mcp auth
+# Opens browser for OAuth consent, tokens saved to ~/.config/google-drive-mcp/tokens.json
+
+# Add to Claude CLI
+claude mcp add google-drive -s user \
+  -e GOOGLE_DRIVE_OAUTH_CREDENTIALS=~/.config/google-drive-mcp-credentials.json \
+  -- ~/.npm-global/bin/google-drive-mcp
+```
+
+### 8.4 Verify MCP Servers
+```bash
+# List configured servers
+claude mcp list
+
+# Check via bridge debug endpoint
+curl http://localhost:8000/mcp
+```
+
+---
+
+## Phase 9: Verification Checklist
+
+### 9.1 Service Health Checks
 ```bash
 # Bridge API
 curl http://localhost:8000/
-# Expected: {"message":"Claude CLI Bridge API","version":"1.6.0","status":"running",...}
+# Expected: {"message":"Claude CLI Bridge API","version":"1.8.1","status":"running",...}
 
 # Models endpoint
 curl http://localhost:8000/v1/models
@@ -840,14 +943,14 @@ curl http://localhost:3001
 # Expected: HTML page
 ```
 
-### 7.2 End-to-End Test
+### 9.2 End-to-End Test
 1. Open browser to `http://SERVER_IP:3001`
 2. Create account (first user becomes admin)
 3. Select "claude-cli" model from dropdown
 4. Send test message: "Say hello"
 5. Should receive Claude response
 
-### 7.3 Image Upload Test
+### 9.3 Image Upload Test
 1. In Open WebUI, click attachment icon
 2. Upload an image
 3. Ask "What's in this image?"
@@ -910,7 +1013,15 @@ docker restart open-webui-claude
 └── upload_*.png              # Uploaded files (created at runtime)
 
 ~/.claude/
-└── projects/                 # Claude CLI session files
+├── projects/                 # Claude CLI session files
+└── .claude.json              # MCP server configuration (user scope)
+
+~/.config/google-drive-mcp/
+├── tokens.json               # Google Drive OAuth tokens
+└── credentials.json          # Google OAuth client credentials (copy from Google Cloud)
+
+~/.npm-global/
+└── bin/                      # Global npm binaries (MCP servers)
 ```
 
 ---
@@ -956,4 +1067,8 @@ sudo ufw allow 3001/tcp
 
 ---
 
-*Document Version: 1.0 | Created: 2025-11-25*
+*Document Version: 1.1 | Updated: 2025-11-27*
+
+**Changelog:**
+- v1.1 (2025-11-27): Added TTS env vars, Tailscale Funnel setup, MCP server setup (Home Assistant, Google Drive)
+- v1.0 (2025-11-25): Initial disaster recovery documentation

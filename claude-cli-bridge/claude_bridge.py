@@ -4,7 +4,7 @@ Claude CLI Bridge for Open WebUI
 Provides an OpenAI-compatible API that proxies requests to Claude CLI
 Supports persistent sessions per chat thread
 
-v1.6.4 - Fix: only use UUID format sessions (agent-* doesn't work with --resume)
+v1.8.0 - Dynamic MCP config loading from Claude CLI config file
 """
 
 import asyncio
@@ -41,11 +41,81 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude CLI Bridge", version="1.6.4")
+app = FastAPI(title="Claude CLI Bridge", version="1.8.0")
 
 # Configuration
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "600"))  # 10 minutes default
+CLAUDE_PROJECT_PATH = os.getenv("CLAUDE_PROJECT_PATH", str(Path.home()))  # Project path for MCP config
+
+# Cache for MCP config (reloaded periodically)
+_mcp_config_cache = None
+_mcp_config_cache_time = 0
+MCP_CONFIG_CACHE_TTL = 60  # Reload config every 60 seconds
+
+
+def get_mcp_config() -> Optional[Dict[str, Any]]:
+    """
+    Dynamically load MCP config from Claude CLI's config file (~/.claude.json).
+    Merges both user-scoped (global) and project-scoped (local) MCP servers.
+    This allows adding MCP servers with 'claude mcp add' without editing the bridge.
+    """
+    global _mcp_config_cache, _mcp_config_cache_time
+
+    # Return cached config if still valid
+    if _mcp_config_cache is not None and (time.time() - _mcp_config_cache_time) < MCP_CONFIG_CACHE_TTL:
+        return _mcp_config_cache
+
+    try:
+        claude_config_path = Path.home() / ".claude.json"
+        if not claude_config_path.exists():
+            logger.warning(f"Claude config not found at {claude_config_path}")
+            return None
+
+        with open(claude_config_path) as f:
+            config = json.load(f)
+
+        # Merge user-scoped (global) and project-scoped (local) MCP servers
+        # User-scoped: root level "mcpServers"
+        # Project-scoped: projects[path]["mcpServers"]
+        mcp_servers = {}
+
+        # Load user-scoped servers first (can be overridden by project-scoped)
+        user_servers = config.get("mcpServers", {})
+        mcp_servers.update(user_servers)
+
+        # Load project-scoped servers (override user-scoped if same name)
+        projects = config.get("projects", {})
+        project_config = projects.get(CLAUDE_PROJECT_PATH, {})
+        project_servers = project_config.get("mcpServers", {})
+        mcp_servers.update(project_servers)
+
+        if mcp_servers:
+            _mcp_config_cache = {"mcpServers": mcp_servers}
+            _mcp_config_cache_time = time.time()
+            logger.info(f"Loaded {len(mcp_servers)} MCP server(s): {', '.join(mcp_servers.keys())}")
+            return _mcp_config_cache
+        else:
+            logger.info(f"No MCP servers configured")
+            return None
+
+    except Exception as e:
+        logger.error(f"Error loading MCP config: {e}")
+        return None
+
+
+# System Prompt with MCP and formatting instructions
+MCP_SYSTEM_PROMPT = """You have access to MCP (Model Context Protocol) tools.
+Use the available MCP tools when they are relevant to the user's request.
+
+FORMATTING: Always use proper markdown formatting in your responses:
+- Use bullet points (- or *) for lists
+- Use numbered lists (1. 2. 3.) for sequences
+- Use headers (## or ###) for sections
+- Use code blocks (```) for code
+- Use **bold** for emphasis
+- Add blank lines between sections for readability
+"""
 
 # In-memory session map: chat_id -> claude_session_id
 session_map: Dict[str, str] = {}
@@ -252,6 +322,16 @@ class SessionNotFoundError(Exception):
     pass
 
 
+def is_error_response(text: str) -> bool:
+    """Check if response is an error (Claude CLI puts errors in stdout with exit code 0)"""
+    error_patterns = [
+        "No conversation found with session ID:",
+        "Error:",
+        "not a valid UUID",
+    ]
+    return any(pattern in text for pattern in error_patterns)
+
+
 async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> tuple[str, Optional[str]]:
     """
     Run Claude CLI prompt and return (response, new_session_id).
@@ -262,6 +342,10 @@ async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeo
         cmd = [CLAUDE_CLI_PATH]
         if session_id:
             cmd.extend(["--resume", session_id])
+        # Add MCP config if available (dynamically loaded from ~/.claude.json)
+        mcp_config = get_mcp_config()
+        if mcp_config:
+            cmd.extend(["--mcp-config", json.dumps(mcp_config)])
         cmd.extend(["-p", prompt, "--dangerously-skip-permissions"])
 
         process = await asyncio.create_subprocess_exec(
@@ -277,16 +361,18 @@ async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeo
             await process.wait()
             raise Exception(f"Claude CLI timed out after {timeout} seconds")
 
+        response = stdout.decode().strip()
         stderr_text = stderr.decode() if stderr else ""
-        if process.returncode != 0:
-            error_msg = stderr_text or "Unknown error"
+
+        # Check for errors (Claude CLI returns exit 0 even on errors, puts error in stdout)
+        if process.returncode != 0 or is_error_response(response):
+            error_msg = stderr_text or response or "Unknown error"
             # Raise specific exception for session not found - caller will retry with history
-            if session_id and ("session" in error_msg.lower() or "not found" in error_msg.lower()):
+            if session_id and ("session" in error_msg.lower() or "not found" in error_msg.lower() or "No conversation found" in response):
                 logger.warning(f"Session {session_id[:8]} not found")
                 raise SessionNotFoundError(session_id)
             raise Exception(f"Claude CLI failed: {error_msg}")
 
-        response = stdout.decode().strip()
         new_session_id = await find_latest_session_id() if not session_id else session_id
         return response, new_session_id
 
@@ -323,6 +409,26 @@ async def list_models() -> ModelList:
 async def list_sessions():
     """List active sessions (debug endpoint)"""
     return {"sessions": session_map}
+
+
+@app.get("/mcp")
+async def get_mcp_status():
+    """Show current MCP configuration (debug endpoint)"""
+    mcp_config = get_mcp_config()
+    if mcp_config:
+        servers = list(mcp_config.get("mcpServers", {}).keys())
+        return {
+            "status": "configured",
+            "project_path": CLAUDE_PROJECT_PATH,
+            "servers": servers,
+            "server_count": len(servers)
+        }
+    return {
+        "status": "no_servers",
+        "project_path": CLAUDE_PROJECT_PATH,
+        "servers": [],
+        "server_count": 0
+    }
 
 
 @app.delete("/sessions/{chat_id}")
@@ -412,6 +518,10 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
 
         final_message = "\n".join(prompt_parts)
 
+        # Prepend MCP system prompt for new sessions (resuming sessions already have context)
+        if not claude_session_id:
+            final_message = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{final_message}"
+
         # Single concise log line for request processing
         msg_preview = (current_user_message[:40] + "...") if current_user_message and len(current_user_message) > 40 else (current_user_message or "file")
         session_status = f"resume:{claude_session_id[:8]}" if claude_session_id else "new"
@@ -434,8 +544,9 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                 if chat_id in session_map:
                     del session_map[chat_id]
                     save_session_map()
-                # Rebuild prompt with history and retry
+                # Rebuild prompt with history and retry (add MCP system prompt since this is effectively a new session)
                 fallback_prompt = history_prompt if history_prompt else final_message
+                fallback_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{fallback_prompt}"
                 logger.info(f"Retrying with history after session expired")
                 response_text, new_session_id = await run_claude_prompt(fallback_prompt, session_id=None)
 
@@ -476,11 +587,14 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
 
 
 async def stream_response(text: str) -> AsyncGenerator[str, None]:
-    """Stream response in OpenAI SSE format"""
+    """Stream response in OpenAI SSE format, preserving newlines"""
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
 
-    words = text.split()
-    for i, word in enumerate(words):
+    # Stream line by line to preserve markdown formatting
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        # Add newline back except for last line
+        content = line + '\n' if i < len(lines) - 1 else line
         chunk = {
             "id": chunk_id,
             "object": "chat.completion.chunk",
@@ -488,12 +602,12 @@ async def stream_response(text: str) -> AsyncGenerator[str, None]:
             "model": "claude-cli",
             "choices": [{
                 "index": 0,
-                "delta": {"content": word + " " if i < len(words) - 1 else word},
+                "delta": {"content": content},
                 "finish_reason": None
             }]
         }
         yield f"data: {json.dumps(chunk)}\n\n"
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.01)
 
     final_chunk = {
         "id": chunk_id,
@@ -511,7 +625,7 @@ async def stream_response(text: str) -> AsyncGenerator[str, None]:
 
 
 async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[str] = None, history_prompt: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> AsyncGenerator[str, None]:
-    """Stream response with thinking indicator while Claude works"""
+    """Stream response after Claude finishes"""
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
 
     def make_chunk(content: str, finish: bool = False):
@@ -527,15 +641,18 @@ async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[s
             }]
         }
 
-    # Build Claude CLI command
     current_prompt = prompt
     current_session = session_id
-    retry_with_history = False
 
-    while True:
+    # Try up to 2 times (original + retry with history)
+    for attempt in range(2):
         cmd = [CLAUDE_CLI_PATH]
         if current_session:
             cmd.extend(["--resume", current_session])
+        # Add MCP config if available (dynamically loaded from ~/.claude.json)
+        mcp_config = get_mcp_config()
+        if mcp_config:
+            cmd.extend(["--mcp-config", json.dumps(mcp_config)])
         cmd.extend(["-p", current_prompt, "--dangerously-skip-permissions"])
 
         process = await asyncio.create_subprocess_exec(
@@ -544,75 +661,54 @@ async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[s
             stderr=asyncio.subprocess.PIPE
         )
 
-        # Show thinking indicator while waiting (only on first attempt)
-        if not retry_with_history:
-            yield f"data: {json.dumps(make_chunk('⏳ '))}\n\n"
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            yield f"data: {json.dumps(make_chunk('Request timed out after ' + str(timeout) + ' seconds'))}\n\n"
+            yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
-        dots = 0
-        while True:
-            try:
-                # Check if process is done (wait 2 seconds between dots)
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=2.0
-                )
-                # Process finished - got the response
-                response = stdout.decode().strip()
-                if process.returncode != 0:
-                    error_msg = stderr.decode() if stderr else "Unknown error"
-                    # Check if it's a session not found error - retry with history
-                    if current_session and ("session" in error_msg.lower() or "not found" in error_msg.lower()):
-                        logger.warning(f"Session {current_session[:8]} not found")
-                        if history_prompt and not retry_with_history:
-                            # Clear bad session and retry with history
-                            if chat_id in session_map:
-                                del session_map[chat_id]
-                                save_session_map()
-                            logger.info(f"Retrying with history after session expired")
-                            current_prompt = history_prompt
-                            current_session = None
-                            retry_with_history = True
-                            break  # Break inner loop to retry outer loop
-                    response = f"Error: {error_msg}"
+        response = stdout.decode().strip()
 
-                # Save session mapping if this was a new session
-                if not current_session and chat_id:
-                    new_session_id = await find_latest_session_id()
-                    if new_session_id:
-                        session_map[chat_id] = new_session_id
+        # Check for errors in stdout (Claude CLI returns exit 0 even on errors)
+        if process.returncode != 0 or is_error_response(response):
+            error_msg = stderr.decode() if stderr else response
+            # Check if session not found - retry with history
+            if current_session and ("session" in error_msg.lower() or "not found" in error_msg.lower() or "No conversation found" in response):
+                logger.warning(f"Session {current_session[:8]} not found, retrying with history")
+                if history_prompt and attempt == 0:
+                    if chat_id in session_map:
+                        del session_map[chat_id]
                         save_session_map()
-                        logger.info(f"New session: {new_session_id[:8]}")
+                    # Add MCP system prompt since this is effectively a new session
+                    current_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{history_prompt}"
+                    current_session = None
+                    continue  # Retry
+            if is_error_response(response):
+                response = f"Error: {response}"
 
-                # Clear thinking indicator and send response
-                yield f"data: {json.dumps(make_chunk(chr(8) * (dots + 3)))}\n\n"  # Backspaces
+        # Save session mapping if this was a new session
+        if not current_session and chat_id:
+            new_session_id = await find_latest_session_id()
+            if new_session_id:
+                session_map[chat_id] = new_session_id
+                save_session_map()
+                logger.info(f"New session: {new_session_id[:8]}")
 
-                # Stream the actual response
-                words = response.split()
-                for i, word in enumerate(words):
-                    yield f"data: {json.dumps(make_chunk(word + (' ' if i < len(words) - 1 else '')))}\n\n"
-                    await asyncio.sleep(0.02)
+        # Stream the response line by line to preserve markdown formatting
+        lines = response.split('\n')
+        for i, line in enumerate(lines):
+            content = line + '\n' if i < len(lines) - 1 else line
+            yield f"data: {json.dumps(make_chunk(content))}\n\n"
+            await asyncio.sleep(0.01)
 
-                # Done - exit both loops
-                yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
-                yield "data: [DONE]\n\n"
-                return
+        yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
-            except asyncio.TimeoutError:
-                # Still running - add a dot
-                dots += 1
-                yield f"data: {json.dumps(make_chunk('.'))}\n\n"
-
-                if dots * 2 > timeout:
-                    process.kill()
-                    yield f"data: {json.dumps(make_chunk(' (timed out)'))}\n\n"
-                    yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-
-        # If we get here, we're retrying with history
-        if not retry_with_history:
-            break  # Something went wrong, exit
-
+    # Fallback if both attempts failed
     yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
     yield "data: [DONE]\n\n"
 
