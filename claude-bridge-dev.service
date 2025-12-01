@@ -1,0 +1,20 @@
+[Unit]
+Description=Claude CLI Bridge Service (DEV)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=jay
+WorkingDirectory=/home/jay/claude-cli-bridge-dev
+Environment=CLAUDE_CLI_PATH=/usr/local/bin/claude
+Environment=CLAUDE_PROJECT_PATH=/home/jay/claude-cli-bridge-dev
+Environment=CLAUDE_SESSION_DIR=/tmp/claude_sessions_dev
+Environment=CLAUDE_UPLOAD_DIR=/tmp/claude_uploads_dev
+Environment=CLAUDE_BRIDGE_PORT=9000
+ExecStart=/usr/bin/python3 /home/jay/claude-cli-bridge-dev/claude_bridge.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

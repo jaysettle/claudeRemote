@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Claude CLI Bridge for Open WebUI
-Provides an OpenAI-compatible API that proxies requests to Claude CLI
+Claude/Codex CLI Bridge for Open WebUI
+Provides an OpenAI-compatible API that proxies requests to CLI agents
 Supports persistent sessions per chat thread
 
-v1.8.0 - Dynamic MCP config loading from Claude CLI config file
+v1.10.0-dev - Adds Codex + Gemini CLI support and richer sequential logging
 """
 
 import asyncio
@@ -14,24 +14,24 @@ import json
 import logging
 import os
 import re
+import shlex
 import tempfile
 import time
 import uuid
-from typing import AsyncGenerator, Optional, Union
 from pathlib import Path
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
 
-# File upload directory
-UPLOAD_DIR = Path(tempfile.gettempdir()) / "claude_uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+# File upload directory (env override for dev/prod separation)
+UPLOAD_DIR = Path(os.getenv("CLAUDE_UPLOAD_DIR", Path(tempfile.gettempdir()) / "claude_uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Session storage directory
-SESSION_DIR = Path(tempfile.gettempdir()) / "claude_sessions"
-SESSION_DIR.mkdir(exist_ok=True)
+# Session storage directory (env override for dev/prod separation)
+SESSION_DIR = Path(os.getenv("CLAUDE_SESSION_DIR", Path(tempfile.gettempdir()) / "claude_sessions"))
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_MAP_FILE = SESSION_DIR / "session_map.json"
 
 # Configure logging
@@ -41,12 +41,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude CLI Bridge", version="1.8.0")
+app = FastAPI(title="Claude CLI Bridge", version="1.9.0-dev")
 
 # Configuration
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "600"))  # 10 minutes default
 CLAUDE_PROJECT_PATH = os.getenv("CLAUDE_PROJECT_PATH", str(Path.home()))  # Project path for MCP config
+CODEX_CLI_PATH = os.getenv("CODEX_CLI_PATH", str(Path.home() / ".npm-global" / "bin" / "codex"))
+CODEX_TIMEOUT = int(os.getenv("CODEX_TIMEOUT", str(CLAUDE_TIMEOUT)))
+GEMINI_CLI_PATH = os.getenv("GEMINI_CLI_PATH", "/usr/local/bin/gemini")
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", str(CLAUDE_TIMEOUT)))
+BRIDGE_PORT = int(os.getenv("CLAUDE_BRIDGE_PORT", "8000"))
+
+SUPPORTED_MODELS = {
+    "claude-cli": {"owned_by": "anthropic"},
+    "codex-cli": {"owned_by": "openai-codex"},
+    "gemini-cli": {"owned_by": "google-gemini"},
+}
 
 # Cache for MCP config (reloaded periodically)
 _mcp_config_cache = None
@@ -117,21 +128,65 @@ FORMATTING: Always use proper markdown formatting in your responses:
 - Add blank lines between sections for readability
 """
 
-# In-memory session map: chat_id -> claude_session_id
-session_map: Dict[str, str] = {}
+# In-memory session map: model_id -> {chat_id -> session_id}
+session_map: Dict[str, Dict[str, str]] = {model: {} for model in SUPPORTED_MODELS.keys()}
+
+
+def _make_trace_logger() -> tuple[str, Callable[[str, str, int], None]]:
+    """Create a per-request trace logger with a short id."""
+    trace_id = uuid.uuid4().hex[:8]
+
+    def log(stage: str, message: str, level: int = logging.INFO):
+        logger.log(level, f"[{trace_id}] {stage} | {message}")
+
+    return trace_id, log
+
+
+def _emit_log(log_fn: Optional[Callable[[str, str, int], None]], stage: str, message: str, level: int = logging.INFO):
+    """Emit a log line using the trace logger if provided."""
+    if log_fn:
+        log_fn(stage, message, level)
+    else:
+        logger.log(level, f"{stage} | {message}")
+
+
+def _safe_cmd(cmd: list[str]) -> str:
+    """Return a shell-safe string for logging."""
+    return " ".join(shlex.quote(str(part)) for part in cmd)
+
+
+def _parse_uuid(candidate: str) -> Optional[str]:
+    """Return the UUID string if candidate matches a UUID format."""
+    if re.match(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$", candidate):
+        return candidate
+    return None
 
 
 def load_session_map():
-    """Load session map from disk."""
+    """Load session map from disk, upgrading legacy single-map layout if needed."""
     global session_map
     try:
         if SESSION_MAP_FILE.exists():
             with open(SESSION_MAP_FILE, 'r') as f:
-                session_map = json.load(f)
-            logger.info(f"Loaded {len(session_map)} sessions from disk")
+                data = json.load(f)
+
+            # Legacy format: {"chat_id": "session_id"}
+            if data and all(isinstance(v, str) for v in data.values()):
+                session_map["claude-cli"] = data
+                logger.info(f"Loaded {len(data)} claude sessions from legacy map")
+            elif isinstance(data, dict):
+                for model_id, mapping in data.items():
+                    if isinstance(mapping, dict) and model_id in SUPPORTED_MODELS:
+                        session_map[model_id] = mapping
+                logger.info(
+                    "Loaded session maps: "
+                    + ", ".join(f"{m}:{len(v)}" for m, v in session_map.items())
+                )
+            else:
+                logger.warning("Session map format unrecognized, starting fresh")
     except Exception as e:
         logger.error(f"Error loading session map: {e}")
-        session_map = {}
+        session_map = {model: {} for model in SUPPORTED_MODELS.keys()}
 
 
 def save_session_map():
@@ -141,6 +196,24 @@ def save_session_map():
             json.dump(session_map, f)
     except Exception as e:
         logger.error(f"Error saving session map: {e}")
+
+
+def get_session_id(model_id: str, chat_id: str) -> Optional[str]:
+    """Lookup session id for model/chat."""
+    return session_map.get(model_id, {}).get(chat_id)
+
+
+def set_session_id(model_id: str, chat_id: str, session_id: str):
+    """Persist session id for model/chat."""
+    session_map.setdefault(model_id, {})[chat_id] = session_id
+    save_session_map()
+
+
+def clear_session_id(model_id: str, chat_id: str):
+    """Remove a mapping for model/chat."""
+    if chat_id in session_map.get(model_id, {}):
+        del session_map[model_id][chat_id]
+        save_session_map()
 
 
 # Load sessions on startup
@@ -280,7 +353,7 @@ class Model(BaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "anthropic"
+    owned_by: str = "bridge"
 
 
 class ModelList(BaseModel):
@@ -288,7 +361,7 @@ class ModelList(BaseModel):
     data: List[Model]
 
 
-async def find_latest_session_id() -> Optional[str]:
+async def find_latest_claude_session_id() -> Optional[str]:
     """Find the most recent Claude session ID from ~/.claude/projects directory."""
     try:
         projects_dir = Path.home() / ".claude" / "projects"
@@ -309,17 +382,147 @@ async def find_latest_session_id() -> Optional[str]:
             # Find first UUID format file (agent-* files don't work with --resume)
             for filepath in files:
                 filename = Path(filepath).stem
-                if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', filename):
-                    return filename
+                uuid_str = _parse_uuid(filename)
+                if uuid_str:
+                    return uuid_str
         return None
     except Exception as e:
         logger.error(f"Error finding session ID: {e}")
         return None
 
 
+async def find_latest_codex_session_id() -> Optional[str]:
+    """Find the most recent Codex session ID from ~/.codex/sessions directory."""
+    try:
+        sessions_dir = Path.home() / ".codex" / "sessions"
+        if not sessions_dir.exists():
+            return None
+
+        files = sorted(
+            sessions_dir.rglob("*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for filepath in files:
+            # Filenames contain a trailing session UUID after the timestamp
+            match = re.search(r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})", filepath.name)
+            if match:
+                uuid_str = _parse_uuid(match.group(1))
+                if uuid_str:
+                    return uuid_str
+        return None
+    except Exception as e:
+        logger.error(f"Error finding Codex session ID: {e}")
+        return None
+
+
+async def find_latest_gemini_session_id() -> Optional[str]:
+    """Find the most recent Gemini session ID from ~/.gemini/tmp/*/chats directory."""
+    try:
+        base = Path.home() / ".gemini" / "tmp"
+        if not base.exists():
+            return None
+        files = sorted(
+            base.glob("*/*/session-*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for filepath in files:
+            match = re.search(r"session-[0-9T\-]+-([a-f0-9-]{36})\.json", filepath.name)
+            if match:
+                uuid_str = _parse_uuid(match.group(1))
+                if uuid_str:
+                    return uuid_str
+        return None
+    except Exception as e:
+        logger.error(f"Error finding Gemini session ID: {e}")
+        return None
+
+
 class SessionNotFoundError(Exception):
     """Raised when Claude CLI session is not found."""
     pass
+
+
+class CodexSessionNotFoundError(Exception):
+    """Raised when Codex CLI session is not found."""
+    pass
+
+
+class GeminiSessionNotFoundError(Exception):
+    """Raised when Gemini CLI session is not found."""
+    pass
+
+
+def normalize_codex_response(text: str) -> str:
+    """
+    Codex can emit JSON with follow_ups. If JSON, extract the primary message string.
+    Fallback: return original text.
+    """
+    try:
+        data = json.loads(text)
+        # If it's already a string, return it
+        if isinstance(data, str):
+            return data
+        # If it's a dict with a string in known keys, return that
+        if isinstance(data, dict):
+            for key in ("message", "content", "text", "output", "response"):
+                if isinstance(data.get(key), str):
+                    return data[key]
+            # If dict has a single string value, return it
+            string_values = [v for v in data.values() if isinstance(v, str)]
+            if len(string_values) == 1:
+                return string_values[0]
+            # If dict has a list of strings under follow_ups, format nicely
+            if isinstance(data.get("follow_ups"), list):
+                return "\n".join(f"- {s}" for s in data["follow_ups"] if isinstance(s, str))
+        # If it's a list of strings, join them
+        if isinstance(data, list):
+            strings = [str(x) for x in data]
+            return "\n".join(strings)
+    except Exception:
+        pass
+    return text
+
+
+def is_followup_prompt(text: str) -> bool:
+    """Detect Open WebUI follow-up generator prompt."""
+    t = text.lower()
+    return (
+        "suggest 3-5 relevant follow-up questions" in t
+        and '"follow_ups"' in text
+        and "json format" in t
+    )
+
+
+def extract_followups(text: str) -> List[str]:
+    """Extract follow-up questions from a response that may be JSON or bullets."""
+    # Try JSON first
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("follow_ups"), list):
+            return [str(x) for x in data["follow_ups"] if isinstance(x, str)]
+        if isinstance(data, list):
+            return [str(x) for x in data if isinstance(x, str)]
+        if isinstance(data, dict):
+            # Flatten any string values
+            vals = [v for v in data.values() if isinstance(v, str)]
+            if vals:
+                return vals
+    except Exception:
+        pass
+
+    # Fallback: parse bullet lines
+    lines = text.splitlines()
+    followups = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(("- ", "* ")):
+            line = line[2:].strip()
+        followups.append(line)
+    return followups
 
 
 def is_error_response(text: str) -> bool:
@@ -332,12 +535,18 @@ def is_error_response(text: str) -> bool:
     return any(pattern in text for pattern in error_patterns)
 
 
-async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> tuple[str, Optional[str]]:
+async def run_claude_prompt(
+    prompt: str,
+    session_id: Optional[str] = None,
+    timeout: int = CLAUDE_TIMEOUT,
+    trace: Optional[Callable[[str, str, int], None]] = None,
+) -> tuple[str, Optional[str]]:
     """
     Run Claude CLI prompt and return (response, new_session_id).
     If session_id is provided, resumes that session.
     Raises SessionNotFoundError if session doesn't exist (caller should retry with history).
     """
+    start = time.time()
     try:
         cmd = [CLAUDE_CLI_PATH]
         if session_id:
@@ -348,6 +557,7 @@ async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeo
             cmd.extend(["--mcp-config", json.dumps(mcp_config)])
         cmd.extend(["-p", prompt, "--dangerously-skip-permissions"])
 
+        _emit_log(trace, "claude.exec.start", f"cmd={_safe_cmd(cmd)}")
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -363,24 +573,217 @@ async def run_claude_prompt(prompt: str, session_id: Optional[str] = None, timeo
 
         response = stdout.decode().strip()
         stderr_text = stderr.decode() if stderr else ""
+        _emit_log(
+            trace,
+            "claude.exec.done",
+            f"rc={process.returncode} elapsed={time.time() - start:.2f}s resp_len={len(response)}",
+        )
 
         # Check for errors (Claude CLI returns exit 0 even on errors, puts error in stdout)
         if process.returncode != 0 or is_error_response(response):
             error_msg = stderr_text or response or "Unknown error"
             # Raise specific exception for session not found - caller will retry with history
             if session_id and ("session" in error_msg.lower() or "not found" in error_msg.lower() or "No conversation found" in response):
-                logger.warning(f"Session {session_id[:8]} not found")
+                _emit_log(trace, "claude.exec.session_missing", f"session={session_id}")
                 raise SessionNotFoundError(session_id)
             raise Exception(f"Claude CLI failed: {error_msg}")
 
-        new_session_id = await find_latest_session_id() if not session_id else session_id
+        new_session_id = await find_latest_claude_session_id() if not session_id else session_id
         return response, new_session_id
 
     except SessionNotFoundError:
         raise  # Re-raise for caller to handle
     except Exception as e:
-        logger.error(f"Claude CLI error: {e}")
+        _emit_log(trace, "claude.exec.error", str(e), level=logging.ERROR)
         raise
+
+
+async def run_codex_prompt(
+    prompt: str,
+    session_id: Optional[str] = None,
+    timeout: int = CODEX_TIMEOUT,
+    trace: Optional[Callable[[str, str, int], None]] = None,
+    followup_prompt: bool = False,
+) -> tuple[str, Optional[str]]:
+    """
+    Run Codex CLI prompt (exec mode) and return (response, new_session_id).
+    If session_id is provided, resumes that session.
+    Raises CodexSessionNotFoundError if session doesn't exist (caller should retry with history).
+    """
+    start = time.time()
+    output_file = Path(tempfile.gettempdir()) / f"codex_out_{uuid.uuid4().hex}.txt"
+    try:
+        # Build command
+        cmd = [CODEX_CLI_PATH, "exec", "--color", "never", "--output-last-message", str(output_file), "--skip-git-repo-check"]
+        # Align with Claude's permissive mode to avoid interactive prompts in the bridge context.
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+
+        if session_id:
+            cmd.extend(["resume", session_id, prompt])
+        else:
+            cmd.append(prompt)
+
+        _emit_log(trace, "codex.exec.start", f"cmd={_safe_cmd(cmd)}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise Exception(f"Codex CLI timed out after {timeout} seconds")
+
+        stdout_text = stdout.decode().strip()
+        stderr_text = stderr.decode() if stderr else ""
+        _emit_log(
+            trace,
+            "codex.exec.done",
+            f"rc={process.returncode} elapsed={time.time() - start:.2f}s stdout_len={len(stdout_text)}",
+        )
+
+        if process.returncode != 0:
+            # Session not found detection
+            if session_id and ("session" in stderr_text.lower() or "resume" in stderr_text.lower() or "not found" in stderr_text.lower()):
+                _emit_log(trace, "codex.exec.session_missing", f"session={session_id}")
+                raise CodexSessionNotFoundError(session_id)
+            raise Exception(f"Codex CLI failed: {stderr_text or stdout_text or 'Unknown error'}")
+
+        # Prefer the output-last-message file for the assistant's reply
+        response_text = ""
+        if output_file.exists():
+            response_text = output_file.read_text(encoding="utf-8", errors="ignore").strip()
+            _emit_log(trace, "codex.exec.output_file", f"chars={len(response_text)}")
+        if not response_text:
+            response_text = stdout_text
+
+        # If this was a follow-up generator, normalize follow-ups into bullets
+        if followup_prompt:
+            followups = extract_followups(response_text)
+            if followups:
+                response_text = "\n".join(f"- {f}" for f in followups)
+            else:
+                response_text = normalize_codex_response(response_text)
+        else:
+            # Strip any structured JSON (e.g., follow_ups) and return only assistant text
+            response_text = normalize_codex_response(response_text)
+
+        new_session_id = await find_latest_codex_session_id() if not session_id else session_id
+        return response_text, new_session_id
+
+    except CodexSessionNotFoundError:
+        raise
+    except Exception as e:
+        _emit_log(trace, "codex.exec.error", str(e), level=logging.ERROR)
+        raise
+    finally:
+        if output_file.exists():
+            try:
+                output_file.unlink()
+            except Exception:
+                pass
+
+
+async def run_gemini_prompt(
+    prompt: str,
+    session_id: Optional[str] = None,
+    timeout: int = GEMINI_TIMEOUT,
+    trace: Optional[Callable[[str, str, int], None]] = None,
+) -> tuple[str, Optional[str]]:
+    """
+    Run Gemini CLI prompt and return (response, new_session_id).
+    Supports --resume <id> and YOLO mode for auto-approvals.
+    """
+    start = time.time()
+    try:
+        cmd = [GEMINI_CLI_PATH, "--yolo", "--output-format", "text"]
+        if session_id:
+            cmd.extend(["--resume", session_id, prompt])
+        else:
+            cmd.append(prompt)
+
+        _emit_log(trace, "gemini.exec.start", f"cmd={_safe_cmd(cmd)}")
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise Exception(f"Gemini CLI timed out after {timeout} seconds")
+
+        stdout_text = stdout.decode().strip()
+        stderr_text = stderr.decode() if stderr else ""
+        _emit_log(
+            trace,
+            "gemini.exec.done",
+            f"rc={process.returncode} elapsed={time.time() - start:.2f}s stdout_len={len(stdout_text)}",
+        )
+
+        if process.returncode != 0:
+            if session_id and ("resume" in stderr_text.lower() or "session" in stderr_text.lower() or "not found" in stderr_text.lower()):
+                _emit_log(trace, "gemini.exec.session_missing", f"session={session_id}")
+                raise GeminiSessionNotFoundError(session_id)
+            raise Exception(f"Gemini CLI failed: {stderr_text or stdout_text or 'Unknown error'}")
+
+        response_text = stdout_text
+        new_session_id = await find_latest_gemini_session_id() if not session_id else session_id
+        return response_text, new_session_id
+
+    except GeminiSessionNotFoundError:
+        raise
+    except Exception as e:
+        _emit_log(trace, "gemini.exec.error", str(e), level=logging.ERROR)
+        raise
+
+
+async def call_model_prompt(
+    model_id: str,
+    prompt: str,
+    session_id: Optional[str],
+    history_prompt: Optional[str],
+    chat_id: str,
+    trace: Optional[Callable[[str, str, int], None]],
+    followup_prompt: bool = False,
+) -> tuple[str, Optional[str]]:
+    """
+    Route prompt execution to the correct model with session-not-found fallback.
+    """
+    if model_id == "claude-cli":
+        try:
+            return await run_claude_prompt(prompt, session_id, trace=trace)
+        except SessionNotFoundError:
+            clear_session_id(model_id, chat_id)
+            fallback_prompt = history_prompt if history_prompt else prompt
+            fallback_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{fallback_prompt}"
+            _emit_log(trace, "claude.retry.history", "retrying without resume after session miss")
+            return await run_claude_prompt(fallback_prompt, session_id=None, trace=trace)
+    elif model_id == "codex-cli":
+        try:
+            return await run_codex_prompt(prompt, session_id, trace=trace, followup_prompt=followup_prompt)
+        except CodexSessionNotFoundError:
+            clear_session_id(model_id, chat_id)
+            fallback_prompt = history_prompt if history_prompt else prompt
+            fallback_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{fallback_prompt}"
+            _emit_log(trace, "codex.retry.history", "retrying without resume after session miss")
+            return await run_codex_prompt(fallback_prompt, session_id=None, trace=trace, followup_prompt=followup_prompt)
+    elif model_id == "gemini-cli":
+        try:
+            return await run_gemini_prompt(prompt, session_id, trace=trace)
+        except GeminiSessionNotFoundError:
+            clear_session_id(model_id, chat_id)
+            fallback_prompt = history_prompt if history_prompt else prompt
+            _emit_log(trace, "gemini.retry.history", "retrying without resume after session miss")
+            return await run_gemini_prompt(fallback_prompt, session_id=None, trace=trace)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported model: {model_id}")
 
 
 # API Endpoints
@@ -391,7 +794,7 @@ async def root():
         "message": "Claude CLI Bridge API",
         "version": app.version,
         "status": "running",
-        "active_sessions": len(session_map)
+        "active_sessions": sum(len(m) for m in session_map.values())
     }
 
 
@@ -400,7 +803,8 @@ async def list_models() -> ModelList:
     """List available models (OpenAI-compatible)"""
     return ModelList(
         data=[
-            Model(id="claude-cli", object="model", owned_by="anthropic")
+            Model(id=model_id, object="model", owned_by=meta["owned_by"])
+            for model_id, meta in SUPPORTED_MODELS.items()
         ]
     )
 
@@ -432,22 +836,44 @@ async def get_mcp_status():
 
 
 @app.delete("/sessions/{chat_id}")
-async def delete_session(chat_id: str):
-    """Delete a session mapping"""
-    if chat_id in session_map:
-        del session_map[chat_id]
-        save_session_map()
-        return {"status": "deleted", "chat_id": chat_id}
+async def delete_session(chat_id: str, model: Optional[str] = Query(None)):
+    """Delete a session mapping; optionally scope to a model."""
+    if model and model not in SUPPORTED_MODELS:
+        raise HTTPException(status_code=400, detail=f"Unsupported model: {model}")
+
+    removed_models = []
+    targets = [model] if model else SUPPORTED_MODELS.keys()
+    for mid in targets:
+        if chat_id in session_map.get(mid, {}):
+            clear_session_id(mid, chat_id)
+            removed_models.append(mid)
+
+    if removed_models:
+        return {"status": "deleted", "chat_id": chat_id, "models": removed_models}
     raise HTTPException(status_code=404, detail="Session not found")
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request, body: ChatCompletionRequest):
     """Handle chat completion requests (OpenAI-compatible)"""
+    trace_id, trace = _make_trace_logger()
     try:
+        model_id = body.model or "claude-cli"
+        if model_id not in SUPPORTED_MODELS:
+            raise HTTPException(status_code=400, detail=f"Unsupported model: {model_id}")
+
         # Get chat ID and check session mapping
         chat_id = get_chat_id(request, body.messages)
-        claude_session_id = session_map.get(chat_id)
+        session_id = get_session_id(model_id, chat_id)
+        # Detect prior sessions for other models (model switch scenario)
+        other_models = [
+            mid for mid in SUPPORTED_MODELS.keys()
+            if mid != model_id and chat_id in session_map.get(mid, {})
+        ]
+        model_switch = not session_id and bool(other_models)
+        trace("request.start", f"model={model_id} chat_id={chat_id} stream={body.stream} session={session_id}")
+        if model_switch:
+            trace("model.switch", f"chat_id={chat_id} prev_models={other_models}")
 
         # Build conversation history from all messages
         conversation_history = []
@@ -492,9 +918,13 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
             history_parts.append(conversation_history[-1])
             history_prompt = "\n".join(history_parts)
 
-        # Use current-only when session exists, history when no session
+        # Use current-only when session exists, history when no session.
+        # If switching models, prefer history to give the new model full context.
+        # For Gemini, always prefer history (no native session reuse needed to keep context).
         prompt_parts = []
-        if claude_session_id:
+        if model_id == "gemini-cli":
+            prompt_parts.append(history_prompt or current_only)
+        elif session_id:
             prompt_parts.append(current_only)
         elif history_prompt:
             prompt_parts.append(history_prompt)
@@ -518,50 +948,52 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
 
         final_message = "\n".join(prompt_parts)
 
-        # Prepend MCP system prompt for new sessions (resuming sessions already have context)
-        if not claude_session_id:
+        # Prepend system prompt for new sessions (resuming sessions already have context)
+        if not session_id:
             final_message = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{final_message}"
 
-        # Single concise log line for request processing
-        msg_preview = (current_user_message[:40] + "...") if current_user_message and len(current_user_message) > 40 else (current_user_message or "file")
-        session_status = f"resume:{claude_session_id[:8]}" if claude_session_id else "new"
-        files_info = f"+{len(binary_paths)}img" if binary_paths else ""
-        logger.info(f"Request: {msg_preview} [{session_status}] {files_info}")
+        msg_preview = (current_user_message[:60] + "...") if current_user_message and len(current_user_message) > 60 else (current_user_message or "file")
+        trace(
+            "prompt.ready",
+            f"preview={msg_preview!r} model={model_id} session={'resume' if session_id else 'new'} files_text={len(file_contents)} files_bin={len(binary_paths)} len={len(final_message)}",
+        )
 
         # Return in OpenAI format
         if body.stream:
-            # Streaming mode - shows thinking indicator while Claude works
             return StreamingResponse(
-                stream_with_thinking(final_message, chat_id, claude_session_id, history_prompt),
-                media_type="text/event-stream"
+                stream_chat_response(
+                    model_id=model_id,
+                    chat_id=chat_id,
+                    session_id=session_id,
+                    prompt=final_message,
+                    history_prompt=history_prompt,
+                    trace=trace,
+                ),
+                media_type="text/event-stream",
             )
         else:
-            # Non-streaming mode - wait for full response
-            try:
-                response_text, new_session_id = await run_claude_prompt(final_message, claude_session_id)
-            except SessionNotFoundError:
-                # Session expired - clear mapping and retry with history
-                if chat_id in session_map:
-                    del session_map[chat_id]
-                    save_session_map()
-                # Rebuild prompt with history and retry (add MCP system prompt since this is effectively a new session)
-                fallback_prompt = history_prompt if history_prompt else final_message
-                fallback_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{fallback_prompt}"
-                logger.info(f"Retrying with history after session expired")
-                response_text, new_session_id = await run_claude_prompt(fallback_prompt, session_id=None)
+            response_text, new_session_id = await call_model_prompt(
+                model_id=model_id,
+                prompt=final_message,
+                session_id=session_id,
+                history_prompt=history_prompt,
+                chat_id=chat_id,
+                trace=trace,
+                followup_prompt=is_followup_prompt(final_message),
+            )
 
             if not response_text:
                 response_text = "No response generated"
-            # Save session mapping if this was a new session
-            if not claude_session_id and new_session_id and chat_id:
-                session_map[chat_id] = new_session_id
-                save_session_map()
-                logger.info(f"New session: {new_session_id[:8]}")
+            # Save session mapping if this was a new session or changed
+            if new_session_id and new_session_id != session_id:
+                set_session_id(model_id, chat_id, new_session_id)
+                trace("session.map.updated", f"model={model_id} chat_id={chat_id} session={new_session_id}")
+
             return {
                 "id": f"chatcmpl-{uuid.uuid4()}",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": body.model,
+                "model": model_id,
                 "choices": [
                     {
                         "index": 0,
@@ -582,50 +1014,19 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing chat completion: {e}")
+        trace("request.error", str(e), level=logging.ERROR)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def stream_response(text: str) -> AsyncGenerator[str, None]:
-    """Stream response in OpenAI SSE format, preserving newlines"""
-    chunk_id = f"chatcmpl-{uuid.uuid4()}"
-
-    # Stream line by line to preserve markdown formatting
-    lines = text.split('\n')
-    for i, line in enumerate(lines):
-        # Add newline back except for last line
-        content = line + '\n' if i < len(lines) - 1 else line
-        chunk = {
-            "id": chunk_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": "claude-cli",
-            "choices": [{
-                "index": 0,
-                "delta": {"content": content},
-                "finish_reason": None
-            }]
-        }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        await asyncio.sleep(0.01)
-
-    final_chunk = {
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": "claude-cli",
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "stop"
-        }]
-    }
-    yield f"data: {json.dumps(final_chunk)}\n\n"
-    yield "data: [DONE]\n\n"
-
-
-async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[str] = None, history_prompt: Optional[str] = None, timeout: int = CLAUDE_TIMEOUT) -> AsyncGenerator[str, None]:
-    """Stream response after Claude finishes"""
+async def stream_chat_response(
+    model_id: str,
+    chat_id: str,
+    session_id: Optional[str],
+    prompt: str,
+    history_prompt: Optional[str],
+    trace: Optional[Callable[[str, str, int], None]],
+) -> AsyncGenerator[str, None]:
+    """Run the model then stream the response preserving newlines."""
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
 
     def make_chunk(content: str, finish: bool = False):
@@ -633,7 +1034,7 @@ async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[s
             "id": chunk_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
-            "model": "claude-cli",
+            "model": model_id,
             "choices": [{
                 "index": 0,
                 "delta": {} if finish else {"content": content},
@@ -641,78 +1042,39 @@ async def stream_with_thinking(prompt: str, chat_id: str, session_id: Optional[s
             }]
         }
 
-    current_prompt = prompt
-    current_session = session_id
+    # Initial thinking indicator
+    yield f"data: {json.dumps(make_chunk('...'))}\n\n"
 
-    # Try up to 2 times (original + retry with history)
-    for attempt in range(2):
-        cmd = [CLAUDE_CLI_PATH]
-        if current_session:
-            cmd.extend(["--resume", current_session])
-        # Add MCP config if available (dynamically loaded from ~/.claude.json)
-        mcp_config = get_mcp_config()
-        if mcp_config:
-            cmd.extend(["--mcp-config", json.dumps(mcp_config)])
-        cmd.extend(["-p", current_prompt, "--dangerously-skip-permissions"])
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+    try:
+        response_text, new_session_id = await call_model_prompt(
+            model_id=model_id,
+            prompt=prompt,
+            session_id=session_id,
+            history_prompt=history_prompt,
+            chat_id=chat_id,
+            trace=trace,
         )
 
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            process.kill()
-            yield f"data: {json.dumps(make_chunk('Request timed out after ' + str(timeout) + ' seconds'))}\n\n"
-            yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
-            yield "data: [DONE]\n\n"
-            return
-
-        response = stdout.decode().strip()
-
-        # Check for errors in stdout (Claude CLI returns exit 0 even on errors)
-        if process.returncode != 0 or is_error_response(response):
-            error_msg = stderr.decode() if stderr else response
-            # Check if session not found - retry with history
-            if current_session and ("session" in error_msg.lower() or "not found" in error_msg.lower() or "No conversation found" in response):
-                logger.warning(f"Session {current_session[:8]} not found, retrying with history")
-                if history_prompt and attempt == 0:
-                    if chat_id in session_map:
-                        del session_map[chat_id]
-                        save_session_map()
-                    # Add MCP system prompt since this is effectively a new session
-                    current_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{history_prompt}"
-                    current_session = None
-                    continue  # Retry
-            if is_error_response(response):
-                response = f"Error: {response}"
-
-        # Save session mapping if this was a new session
-        if not current_session and chat_id:
-            new_session_id = await find_latest_session_id()
-            if new_session_id:
-                session_map[chat_id] = new_session_id
-                save_session_map()
-                logger.info(f"New session: {new_session_id[:8]}")
+        if new_session_id and new_session_id != session_id:
+            set_session_id(model_id, chat_id, new_session_id)
+            _emit_log(trace, "session.map.updated", f"model={model_id} chat_id={chat_id} session={new_session_id}")
 
         # Stream the response line by line to preserve markdown formatting
-        lines = response.split('\n')
+        lines = (response_text or "").split('\n')
         for i, line in enumerate(lines):
             content = line + '\n' if i < len(lines) - 1 else line
             yield f"data: {json.dumps(make_chunk(content))}\n\n"
             await asyncio.sleep(0.01)
 
-        yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+    except Exception as e:
+        error_msg = f"Error: {e}"
+        _emit_log(trace, "stream.error", error_msg, level=logging.ERROR)
+        yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
 
-    # Fallback if both attempts failed
     yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
     yield "data: [DONE]\n\n"
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=BRIDGE_PORT, log_level="info")
