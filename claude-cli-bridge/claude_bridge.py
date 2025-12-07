@@ -20,10 +20,21 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union
+from enum import Enum
+from dataclasses import dataclass, asdict
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+# Optional: Anthropic API for true streaming (claude-api model)
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    anthropic = None
+
 
 # File upload directory (env override for dev/prod separation)
 UPLOAD_DIR = Path(os.getenv("CLAUDE_UPLOAD_DIR", Path(tempfile.gettempdir()) / "claude_uploads"))
@@ -35,13 +46,14 @@ SESSION_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_MAP_FILE = SESSION_DIR / "session_map.json"
 
 # Configure logging
+# Default to DEBUG so stream tracing is visible when tailing logs
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Claude CLI Bridge", version="1.9.0-dev")
+app = FastAPI(title="Claude CLI Bridge", version="1.12.2-dev")
 
 # Configuration
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH", "claude")
@@ -52,12 +64,354 @@ CODEX_TIMEOUT = int(os.getenv("CODEX_TIMEOUT", str(CLAUDE_TIMEOUT)))
 GEMINI_CLI_PATH = os.getenv("GEMINI_CLI_PATH", "/usr/local/bin/gemini")
 GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", str(CLAUDE_TIMEOUT)))
 BRIDGE_PORT = int(os.getenv("CLAUDE_BRIDGE_PORT", "8000"))
+CLAUDE_DISABLE_MCP = os.getenv("CLAUDE_DISABLE_MCP", "1") == "1"  # Default: disable MCP to avoid slow startup
 
 SUPPORTED_MODELS = {
     "claude-cli": {"owned_by": "anthropic"},
+    # "claude-api": {"owned_by": "anthropic-api"},  # DISABLED
     "codex-cli": {"owned_by": "openai-codex"},
     "gemini-cli": {"owned_by": "google-gemini"},
+    "interactive-discussion": {"owned_by": "collaborative"},
 }
+
+# Anthropic API config
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+
+# ============================================================================
+# CLAUDE API TOOLS - Agentic capabilities for claude-api model
+# ============================================================================
+
+import subprocess
+import glob as glob_module
+import shutil
+
+# Tool definitions for Anthropic API
+CLAUDE_API_TOOLS = [
+    {
+        "name": "read_file",
+        "description": "Read the contents of a file. Use this to view file contents, code, configs, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (1-indexed). Optional.",
+                    "default": 1
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read. Optional, defaults to 500.",
+                    "default": 500
+                }
+            },
+            "required": ["path"]
+        }
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to write"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write to the file"
+                }
+            },
+            "required": ["path", "content"]
+        }
+    },
+    {
+        "name": "bash",
+        "description": "Execute a bash command on the server. Use for running scripts, git commands, system operations, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to execute"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds. Default 60.",
+                    "default": 60
+                }
+            },
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "glob",
+        "description": "Find files matching a glob pattern. Use to discover files in the filesystem.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern like '**/*.py' or 'src/**/*.ts'"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Base directory to search in. Defaults to home directory.",
+                    "default": "~"
+                }
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "grep",
+        "description": "Search for a pattern in files. Returns matching lines with file paths and line numbers.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regular expression pattern to search for"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search in. Defaults to current directory.",
+                    "default": "."
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": "Optional glob pattern to filter files, e.g., '*.py'",
+                    "default": "*"
+                }
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "list_directory",
+        "description": "List files and directories in a path.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to list. Defaults to home directory.",
+                    "default": "~"
+                }
+            },
+            "required": []
+        }
+    }
+]
+
+
+def execute_tool(tool_name: str, tool_input: Dict[str, Any], trace: Optional[Callable] = None) -> str:
+    """Execute a tool and return the result as a string."""
+    _emit_log(trace, f"tool.{tool_name}", f"input={tool_input}")
+
+    try:
+        if tool_name == "read_file":
+            return _tool_read_file(tool_input)
+        elif tool_name == "write_file":
+            return _tool_write_file(tool_input)
+        elif tool_name == "bash":
+            return _tool_bash(tool_input)
+        elif tool_name == "glob":
+            return _tool_glob(tool_input)
+        elif tool_name == "grep":
+            return _tool_grep(tool_input)
+        elif tool_name == "list_directory":
+            return _tool_list_directory(tool_input)
+        else:
+            return f"Error: Unknown tool '{tool_name}'"
+    except Exception as e:
+        _emit_log(trace, f"tool.{tool_name}.error", str(e), level=logging.ERROR)
+        return f"Error executing {tool_name}: {str(e)}"
+
+
+def _tool_read_file(input: Dict[str, Any]) -> str:
+    """Read file contents."""
+    path = os.path.expanduser(input.get("path", ""))
+    offset = input.get("offset", 1)
+    limit = input.get("limit", 500)
+
+    if not os.path.exists(path):
+        return f"Error: File not found: {path}"
+
+    if os.path.isdir(path):
+        return f"Error: Path is a directory, not a file: {path}"
+
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+
+        # Apply offset and limit
+        start = max(0, offset - 1)
+        end = start + limit
+        selected_lines = lines[start:end]
+
+        # Format with line numbers
+        result_lines = []
+        for i, line in enumerate(selected_lines, start=start+1):
+            result_lines.append(f"{i:6d}\t{line.rstrip()}")
+
+        result = "\n".join(result_lines)
+        if len(lines) > end:
+            result += f"\n... ({len(lines) - end} more lines)"
+
+        return result
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
+
+
+def _tool_write_file(input: Dict[str, Any]) -> str:
+    """Write content to file."""
+    path = os.path.expanduser(input.get("path", ""))
+    content = input.get("content", "")
+
+    # Safety check - don't allow writing to certain paths
+    dangerous_paths = ["/etc/", "/usr/", "/bin/", "/sbin/", "/boot/", "/root/"]
+    for dp in dangerous_paths:
+        if path.startswith(dp):
+            return f"Error: Cannot write to protected path: {path}"
+
+    try:
+        # Create directory if needed
+        dir_path = os.path.dirname(path)
+        if dir_path and not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+
+        return f"Successfully wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return f"Error writing file: {str(e)}"
+
+
+def _tool_bash(input: Dict[str, Any]) -> str:
+    """Execute bash command."""
+    command = input.get("command", "")
+    timeout = input.get("timeout", 60)
+
+    # Safety check - block certain dangerous commands
+    dangerous_patterns = ["rm -rf /", "mkfs", "dd if=", "> /dev/", ":(){ :|:& };:"]
+    for dp in dangerous_patterns:
+        if dp in command:
+            return f"Error: Potentially dangerous command blocked: {command}"
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=os.path.expanduser("~")
+        )
+
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            if output:
+                output += "\n--- stderr ---\n"
+            output += result.stderr
+
+        if result.returncode != 0:
+            output += f"\n[Exit code: {result.returncode}]"
+
+        # Truncate if too long
+        if len(output) > 50000:
+            output = output[:50000] + "\n... (output truncated)"
+
+        return output if output else "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"Error: Command timed out after {timeout} seconds"
+    except Exception as e:
+        return f"Error executing command: {str(e)}"
+
+
+def _tool_glob(input: Dict[str, Any]) -> str:
+    """Find files matching glob pattern."""
+    pattern = input.get("pattern", "")
+    base_path = os.path.expanduser(input.get("path", "~"))
+
+    try:
+        full_pattern = os.path.join(base_path, pattern)
+        matches = glob_module.glob(full_pattern, recursive=True)
+
+        # Sort by modification time (newest first)
+        matches.sort(key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0, reverse=True)
+
+        # Limit results
+        if len(matches) > 100:
+            matches = matches[:100]
+            return "\n".join(matches) + f"\n... ({len(matches)} results shown, more available)"
+
+        return "\n".join(matches) if matches else "No files found matching pattern"
+    except Exception as e:
+        return f"Error in glob: {str(e)}"
+
+
+def _tool_grep(input: Dict[str, Any]) -> str:
+    """Search for pattern in files."""
+    pattern = input.get("pattern", "")
+    path = os.path.expanduser(input.get("path", "."))
+    file_pattern = input.get("file_pattern", "*")
+
+    try:
+        # Use grep command for efficiency
+        cmd = f"grep -rn --include='{file_pattern}' '{pattern}' '{path}' 2>/dev/null | head -100"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+
+        output = result.stdout.strip()
+        if not output:
+            return f"No matches found for pattern '{pattern}'"
+
+        return output
+    except subprocess.TimeoutExpired:
+        return "Error: Search timed out"
+    except Exception as e:
+        return f"Error in grep: {str(e)}"
+
+
+def _tool_list_directory(input: Dict[str, Any]) -> str:
+    """List directory contents."""
+    path = os.path.expanduser(input.get("path", "~"))
+
+    if not os.path.exists(path):
+        return f"Error: Path not found: {path}"
+
+    if not os.path.isdir(path):
+        return f"Error: Not a directory: {path}"
+
+    try:
+        entries = os.listdir(path)
+        result_lines = []
+
+        for entry in sorted(entries):
+            full_path = os.path.join(path, entry)
+            if os.path.isdir(full_path):
+                result_lines.append(f"[DIR]  {entry}/")
+            else:
+                try:
+                    size = os.path.getsize(full_path)
+                    result_lines.append(f"[FILE] {entry} ({size} bytes)")
+                except:
+                    result_lines.append(f"[FILE] {entry}")
+
+        return "\n".join(result_lines) if result_lines else "(empty directory)"
+    except Exception as e:
+        return f"Error listing directory: {str(e)}"
+
+
+
 
 # Cache for MCP config (reloaded periodically)
 _mcp_config_cache = None
@@ -71,6 +425,10 @@ def get_mcp_config() -> Optional[Dict[str, Any]]:
     Merges both user-scoped (global) and project-scoped (local) MCP servers.
     This allows adding MCP servers with 'claude mcp add' without editing the bridge.
     """
+    # Honor explicit disable flag to avoid MCP-induced latency
+    if CLAUDE_DISABLE_MCP:
+        return None
+
     global _mcp_config_cache, _mcp_config_cache_time
 
     # Return cached config if still valid
@@ -153,6 +511,25 @@ def _emit_log(log_fn: Optional[Callable[[str, str, int], None]], stage: str, mes
 def _safe_cmd(cmd: list[str]) -> str:
     """Return a shell-safe string for logging."""
     return " ".join(shlex.quote(str(part)) for part in cmd)
+
+
+def _truncate(text: str, limit: int = 200) -> str:
+    """Truncate long text for logs."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "... [truncated]"
+
+
+def _iter_text_from_content(content: Any):
+    """Yield text fragments from Claude content payloads."""
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get('type') == 'text':
+                text = block.get('text', '')
+                if text:
+                    yield text
+    elif isinstance(content, str) and content:
+        yield content
 
 
 def _parse_uuid(candidate: str) -> Optional[str]:
@@ -545,17 +922,24 @@ async def run_claude_prompt(
     Run Claude CLI prompt and return (response, new_session_id).
     If session_id is provided, resumes that session.
     Raises SessionNotFoundError if session doesn't exist (caller should retry with history).
+    History is limited to last 10 messages to avoid "Argument list too long" errors.
     """
     start = time.time()
     try:
         cmd = [CLAUDE_CLI_PATH]
         if session_id:
             cmd.extend(["--resume", session_id])
-        # Add MCP config if available (dynamically loaded from ~/.claude.json)
-        mcp_config = get_mcp_config()
-        if mcp_config:
-            cmd.extend(["--mcp-config", json.dumps(mcp_config)])
+        # Add MCP config if available (dynamically loaded from ~/.claude.json) unless disabled
+        if CLAUDE_DISABLE_MCP:
+            cmd.extend(["--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"])
+        else:
+            mcp_config = get_mcp_config()
+            if mcp_config:
+                cmd.extend(["--mcp-config", json.dumps(mcp_config)])
         cmd.extend(["-p", prompt, "--dangerously-skip-permissions"])
+
+        # Log the exact prompt sent to Claude (trace-aware so it lands in per-request logs)
+        _emit_log(trace, "claude.prompt.full", f"prompt={_truncate(prompt, limit=4000)}", level=logging.INFO)
 
         _emit_log(trace, "claude.exec.start", f"cmd={_safe_cmd(cmd)}")
         process = await asyncio.create_subprocess_exec(
@@ -744,6 +1128,273 @@ async def run_gemini_prompt(
         raise
 
 
+
+
+
+async def stream_claude_api_with_tools(
+    prompt: str,
+    messages: List[Dict[str, Any]],
+    trace: Optional[Callable[[str, str, int], None]] = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream response from Claude API with tool use capabilities.
+    Implements an agentic loop that can execute tools and continue.
+    """
+    if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="Anthropic API not configured. Set ANTHROPIC_API_KEY environment variable.")
+
+    _emit_log(trace, "claude-api-tools.start", f"model={ANTHROPIC_MODEL}")
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # Convert messages to Anthropic format
+    api_messages = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        msg_content = msg.get("content", "")
+        if role == "system":
+            continue
+        if role == "assistant":
+            api_messages.append({"role": "assistant", "content": msg_content})
+        else:
+            api_messages.append({"role": "user", "content": msg_content})
+
+    # Add current prompt
+    if prompt and (not api_messages or api_messages[-1].get("content") != prompt):
+        api_messages.append({"role": "user", "content": prompt})
+
+    # Enhanced system message for tool use
+    system_msg = """You are a helpful AI assistant with access to tools for interacting with the server filesystem and executing commands.
+
+Available tools:
+- read_file: Read file contents
+- write_file: Write content to files
+- bash: Execute shell commands
+- glob: Find files by pattern
+- grep: Search file contents
+- list_directory: List directory contents
+
+When you need to access files, run commands, or interact with the system, use these tools.
+Always explain what you're doing and why.
+
+""" + MCP_SYSTEM_PROMPT
+
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_msg = msg.get("content", "") + "\n\n" + system_msg
+            break
+
+    max_iterations = 20  # Prevent infinite loops
+    iteration = 0
+
+    try:
+        while iteration < max_iterations:
+            iteration += 1
+            _emit_log(trace, "claude-api-tools.iteration", f"iteration={iteration}")
+
+            # Make API call with tools
+            # Retry logic for 529 overloaded errors
+            max_retries = 3
+            retry_delay = 2
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = client.messages.create(
+                        model=ANTHROPIC_MODEL,
+                        max_tokens=8192,
+                        system=system_msg,
+                        messages=api_messages,
+                        tools=CLAUDE_API_TOOLS,
+                    )
+                    break  # Success, exit retry loop
+                except anthropic.APIStatusError as e:
+                    if e.status_code == 529 and attempt < max_retries - 1:
+                        _emit_log(trace, "claude-api-tools.retry", f"API overloaded, retrying in {retry_delay}s (attempt {attempt + 1}/{max_retries})")
+                        yield f"⏳ API busy, retrying in {retry_delay}s...\n"
+                        import time
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        last_error = e
+                    else:
+                        raise
+            else:
+                # All retries failed
+                if last_error:
+                    raise last_error
+
+            # Process response blocks
+            assistant_content = []
+            has_tool_use = False
+
+            for block in response.content:
+                if block.type == "text":
+                    # Stream text content
+                    text = block.text
+                    assistant_content.append({"type": "text", "text": text})
+                    # Yield text in chunks for streaming effect
+                    words = text.split(' ')
+                    for i, word in enumerate(words):
+                        if i > 0:
+                            yield ' '
+                        yield word
+
+                elif block.type == "tool_use":
+                    has_tool_use = True
+                    tool_name = block.name
+                    tool_input = block.input
+                    tool_use_id = block.id
+
+                    # Show tool usage to user
+                    yield f"\n\n🔧 **Using tool: {tool_name}**\n"
+                    yield f"```\n{json.dumps(tool_input, indent=2)}\n```\n"
+
+                    # Execute the tool
+                    tool_result = execute_tool(tool_name, tool_input, trace)
+
+                    # Show result preview
+                    result_preview = tool_result[:500] + "..." if len(tool_result) > 500 else tool_result
+                    yield f"\n📋 **Result:**\n```\n{result_preview}\n```\n\n"
+
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": tool_use_id,
+                        "name": tool_name,
+                        "input": tool_input
+                    })
+
+                    # Add tool result to messages for next iteration
+                    api_messages.append({"role": "assistant", "content": assistant_content})
+                    api_messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": tool_result
+                        }]
+                    })
+                    assistant_content = []  # Reset for next response
+
+            # Check if we should continue or stop
+            if response.stop_reason == "end_turn" or not has_tool_use:
+                _emit_log(trace, "claude-api-tools.done", f"iterations={iteration}")
+                break
+
+        if iteration >= max_iterations:
+            yield "\n\n⚠️ Maximum tool iterations reached."
+
+    except Exception as e:
+        _emit_log(trace, "claude-api-tools.error", str(e), level=logging.ERROR)
+        raise
+
+
+
+
+async def stream_claude_api(
+    prompt: str,
+    messages: List[Dict[str, Any]],
+    trace: Optional[Callable[[str, str, int], None]] = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream response from Claude API with true token-by-token streaming.
+    """
+    if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="Anthropic API not configured. Set ANTHROPIC_API_KEY environment variable.")
+
+    _emit_log(trace, "claude-api.start", f"model={ANTHROPIC_MODEL}")
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    # Convert messages to Anthropic format
+    api_messages = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        msg_content = msg.get("content", "")
+        if role == "system":
+            continue  # Handle system separately
+        if role == "assistant":
+            api_messages.append({"role": "assistant", "content": msg_content})
+        else:
+            api_messages.append({"role": "user", "content": msg_content})
+
+    # Add current prompt if not already in messages
+    if prompt and (not api_messages or api_messages[-1].get("content") != prompt):
+        api_messages.append({"role": "user", "content": prompt})
+
+    # Extract system message
+    system_msg = MCP_SYSTEM_PROMPT
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_msg = msg.get("content", "") + "\n\n" + system_msg
+            break
+
+    try:
+        with client.messages.stream(
+            model=ANTHROPIC_MODEL,
+            max_tokens=8192,
+            system=system_msg,
+            messages=api_messages,
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+        _emit_log(trace, "claude-api.done", "streaming complete")
+    except Exception as e:
+        _emit_log(trace, "claude-api.error", str(e), level=logging.ERROR)
+        raise
+
+
+
+async def run_claude_api_prompt(
+    prompt: str,
+    trace: Optional[Callable[[str, str, int], None]] = None,
+) -> tuple[str, Optional[str]]:
+    """
+    Non-streaming Claude API call for tasks like follow-up generation.
+    Returns (response_text, session_id) - session_id is None for API calls.
+    """
+    if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="Anthropic API not configured")
+    
+    _emit_log(trace, "claude-api.nonstream.start", f"model={ANTHROPIC_MODEL}")
+    
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    
+    try:
+        # Retry logic for 529 errors
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                response = client.messages.create(
+                    model=ANTHROPIC_MODEL,
+                    max_tokens=1024,  # Shorter for task responses
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                break
+            except anthropic.APIStatusError as e:
+                if e.status_code == 529 and attempt < max_retries - 1:
+                    _emit_log(trace, "claude-api.nonstream.retry", f"API overloaded, retrying in {retry_delay}s")
+                    import time
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    raise
+        
+        # Extract text from response
+        response_text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                response_text += block.text
+        
+        _emit_log(trace, "claude-api.nonstream.done", f"len={len(response_text)}")
+        return response_text, None
+        
+    except Exception as e:
+        _emit_log(trace, "claude-api.nonstream.error", str(e), level=logging.ERROR)
+        raise HTTPException(status_code=500, detail=f"Claude API error: {str(e)}")
+
+
 async def call_model_prompt(
     model_id: str,
     prompt: str,
@@ -782,6 +1433,9 @@ async def call_model_prompt(
             fallback_prompt = history_prompt if history_prompt else prompt
             _emit_log(trace, "gemini.retry.history", "retrying without resume after session miss")
             return await run_gemini_prompt(fallback_prompt, session_id=None, trace=trace)
+    # elif model_id == "claude-api":
+    #     # Non-streaming claude-api for tasks like follow-up generation (DISABLED)
+    #     return await run_claude_api_prompt(prompt, trace=trace)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported model: {model_id}")
 
@@ -835,6 +1489,26 @@ async def get_mcp_status():
     }
 
 
+@app.get("/discussions")
+async def list_discussions():
+    """List active discussion states (debug endpoint)"""
+    discussions_info = {}
+    for chat_id, state in discussion_states.items():
+        discussions_info[chat_id] = {
+            "stage": state.stage.value,
+            "mode": state.mode,
+            "current_round": state.current_round,
+            "max_rounds": state.max_rounds,
+            "topic": state.topic[:100] + "..." if len(state.topic) > 100 else state.topic,
+            "models": state.models,
+            "history_count": len(state.discussion_history)
+        }
+    return {
+        "active_discussions": discussions_info,
+        "count": len(discussions_info)
+    }
+
+
 @app.delete("/sessions/{chat_id}")
 async def delete_session(chat_id: str, model: Optional[str] = Query(None)):
     """Delete a session mapping; optionally scope to a model."""
@@ -861,6 +1535,10 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         model_id = body.model or "claude-cli"
         if model_id not in SUPPORTED_MODELS:
             raise HTTPException(status_code=400, detail=f"Unsupported model: {model_id}")
+
+        # Handle interactive discussion mode (SAFE: only affects interactive-discussion model)
+        if model_id == "interactive-discussion":
+            return await handle_interactive_discussion(request, body)
 
         # Get chat ID and check session mapping
         chat_id = get_chat_id(request, body.messages)
@@ -910,12 +1588,17 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
 
         history_prompt = None
         if len(conversation_history) > 1:
-            history_parts = ["[Conversation history]"]
-            for entry in conversation_history[:-1]:
+            # Limit history to last 10 messages to avoid "Argument list too long" errors
+            # This provides enough context while staying under argument limits
+            max_history_messages = 10
+            recent_history = conversation_history[-max_history_messages:] if len(conversation_history) > max_history_messages else conversation_history
+
+            history_parts = ["[Conversation history - last {} messages]".format(len(recent_history))]
+            for entry in recent_history[:-1]:
                 history_parts.append(entry)
             history_parts.append("")
             history_parts.append("[Current message]")
-            history_parts.append(conversation_history[-1])
+            history_parts.append(recent_history[-1])
             history_prompt = "\n".join(history_parts)
 
         # Use current-only when session exists, history when no session.
@@ -952,6 +1635,19 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         if not session_id:
             final_message = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{final_message}"
 
+        # Check if prompt is too large for command line args (>100KB to be safe)
+        # This can happen with follow-up generation prompts that include full chat history
+        prompt_size = len(final_message.encode('utf-8'))
+        if prompt_size > 100_000:
+            # Truncate to last 100KB to fit in command line arguments
+            final_message_bytes = final_message.encode('utf-8')
+            final_message = final_message_bytes[-100_000:].decode('utf-8', errors='ignore')
+            trace(
+                "prompt.truncated",
+                f"Prompt too large ({prompt_size} bytes), truncated to 100KB",
+                level=logging.WARNING,
+            )
+
         msg_preview = (current_user_message[:60] + "...") if current_user_message and len(current_user_message) > 60 else (current_user_message or "file")
         trace(
             "prompt.ready",
@@ -960,30 +1656,62 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
 
         # Return in OpenAI format
         if body.stream:
-            return StreamingResponse(
-                stream_chat_response(
-                    model_id=model_id,
-                    chat_id=chat_id,
-                    session_id=session_id,
-                    prompt=final_message,
-                    history_prompt=history_prompt,
-                    trace=trace,
-                ),
-                media_type="text/event-stream",
-            )
+            # Use incremental streaming for claude-cli and codex-cli
+            if model_id == "claude-cli":
+                return StreamingResponse(
+                    stream_claude_incremental(
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        prompt=final_message,
+                        history_prompt=history_prompt,
+                        trace=trace,
+                    ),
+                    media_type="text/event-stream",
+                )
+            elif model_id == "codex-cli":
+                return StreamingResponse(
+                    stream_codex_incremental(
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        prompt=final_message,
+                        history_prompt=history_prompt,
+                        trace=trace,
+                    ),
+                    media_type="text/event-stream",
+                )
+            else:
+                # Gemini and other models use generic streaming
+                return StreamingResponse(
+                    stream_chat_response(
+                        model_id=model_id,
+                        chat_id=chat_id,
+                        session_id=session_id,
+                        prompt=final_message,
+                        history_prompt=history_prompt,
+                        trace=trace,
+                        messages=[m.dict() if hasattr(m, "dict") else m for m in body.messages] if body.messages else None,
+                    ),
+                    media_type="text/event-stream",
+                )
         else:
-            response_text, new_session_id = await call_model_prompt(
-                model_id=model_id,
-                prompt=final_message,
-                session_id=session_id,
-                history_prompt=history_prompt,
-                chat_id=chat_id,
-                trace=trace,
-                followup_prompt=is_followup_prompt(final_message),
-            )
+            # TEMPORARY: Skip follow-up generation because Claude CLI -p mode is hanging
+            if is_followup_prompt(final_message):
+                trace("followup.skipped", "returning empty follow-ups (CLI -p mode broken)")
+                response_text = '{"follow_ups": []}'
+                new_session_id = session_id
+            else:
+                response_text, new_session_id = await call_model_prompt(
+                    model_id=model_id,
+                    prompt=final_message,
+                    session_id=session_id,
+                    history_prompt=history_prompt,
+                    chat_id=chat_id,
+                    trace=trace,
+                    followup_prompt=is_followup_prompt(final_message),
+                )
 
-            if not response_text:
-                response_text = "No response generated"
+                if not response_text:
+                    response_text = "No response generated"
             # Save session mapping if this was a new session or changed
             if new_session_id and new_session_id != session_id:
                 set_session_id(model_id, chat_id, new_session_id)
@@ -1018,6 +1746,347 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def stream_codex_incremental(
+    chat_id: str,
+    session_id: Optional[str],
+    prompt: str,
+    history_prompt: Optional[str],
+    trace: Optional[Callable[[str, str, int], None]],
+) -> AsyncGenerator[str, None]:
+    """Stream codex output incrementally as it arrives from CLI."""
+    chunk_id = f"chatcmpl-{uuid.uuid4()}"
+
+    def make_chunk(content: str, finish: bool = False):
+        return {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "codex-cli",
+            "choices": [{
+                "index": 0,
+                "delta": {} if finish else {"content": content},
+                "finish_reason": "stop" if finish else None
+            }]
+        }
+
+    # Initial thinking indicator
+    yield f"data: {json.dumps(make_chunk('...'))}\n\n"
+
+    output_file = Path(tempfile.gettempdir()) / f"codex_out_{uuid.uuid4().hex}.txt"
+    start = time.time()
+
+    try:
+        # Build command
+        cmd = [CODEX_CLI_PATH, "exec", "--color", "never", "--output-last-message", str(output_file), "--skip-git-repo-check"]
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+
+        if session_id:
+            cmd.extend(["resume", session_id, prompt])
+        else:
+            cmd.append(prompt)
+
+        _emit_log(trace, "codex.stream.start", f"cmd={_safe_cmd(cmd)}")
+
+        # Start the process
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        # Stream stdout incrementally
+        full_output = []
+        stderr_chunks = []
+
+        # Read stderr in background
+        async def read_stderr():
+            if process.stderr:
+                async for line in process.stderr:
+                    stderr_chunks.append(line)
+
+        stderr_task = asyncio.create_task(read_stderr())
+
+        # Stream stdout as it arrives
+        if process.stdout:
+            async for line in process.stdout:
+                try:
+                    text = line.decode('utf-8', errors='ignore')
+                    full_output.append(text)
+                    # Send each line as a chunk
+                    yield f"data: {json.dumps(make_chunk(text))}\n\n"
+                except Exception as e:
+                    _emit_log(trace, "codex.stream.decode_error", str(e), level=logging.WARNING)
+
+        # Wait for process to complete
+        await process.wait()
+        await stderr_task
+
+        elapsed = time.time() - start
+        stderr_text = b''.join(stderr_chunks).decode('utf-8', errors='ignore') if stderr_chunks else ""
+        stdout_text = ''.join(full_output)
+
+        _emit_log(
+            trace,
+            "codex.stream.done",
+            f"rc={process.returncode} elapsed={elapsed:.2f}s stdout_len={len(stdout_text)}",
+        )
+
+        # Handle errors
+        if process.returncode != 0:
+            if session_id and ("session" in stderr_text.lower() or "resume" in stderr_text.lower() or "not found" in stderr_text.lower()):
+                _emit_log(trace, "codex.stream.session_missing", f"session={session_id}")
+                # Retry with history
+                clear_session_id("codex-cli", chat_id)
+                fallback_prompt = history_prompt if history_prompt else prompt
+                fallback_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{fallback_prompt}"
+                _emit_log(trace, "codex.stream.retry.history", "retrying without resume after session miss")
+
+                # Re-stream with fallback
+                async for chunk in stream_codex_incremental(chat_id, None, fallback_prompt, None, trace):
+                    yield chunk
+                return
+            else:
+                error_msg = f"Codex CLI failed: {stderr_text or stdout_text or 'Unknown error'}"
+                yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
+                yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        # Update session mapping
+        new_session_id = await find_latest_codex_session_id() if not session_id else session_id
+        if new_session_id and new_session_id != session_id:
+            set_session_id("codex-cli", chat_id, new_session_id)
+            _emit_log(trace, "session.map.updated", f"model=codex-cli chat_id={chat_id} session={new_session_id}")
+
+    except Exception as e:
+        error_msg = f"Error: {e}"
+        _emit_log(trace, "codex.stream.error", error_msg, level=logging.ERROR)
+        yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
+    finally:
+        if output_file.exists():
+            try:
+                output_file.unlink()
+            except Exception:
+                pass
+
+    yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+async def stream_claude_incremental(
+    chat_id: str,
+    session_id: Optional[str],
+    prompt: str,
+    history_prompt: Optional[str],
+    trace: Optional[Callable[[str, str, int], None]],
+) -> AsyncGenerator[str, None]:
+    """Stream Claude CLI output incrementally using --output-format stream-json."""
+    chunk_id = f"chatcmpl-{uuid.uuid4()}"
+
+    def make_chunk(content: str, finish: bool = False):
+        return {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "claude-cli",
+            "choices": [{
+                "index": 0,
+                "delta": {} if finish else {"content": content},
+                "finish_reason": "stop" if finish else None
+            }]
+        }
+
+    # Initial thinking indicator
+    yield f"data: {json.dumps(make_chunk('...'))}\n\n"
+
+    start = time.time()
+    accumulated_text = []
+    emitted_text = False
+    first_event_at = None
+
+    try:
+        # Build command with stream-json output
+        cmd = [CLAUDE_CLI_PATH]
+        if session_id:
+            cmd.extend(["--resume", session_id])
+
+        # Add MCP config if available (disabled by default to avoid slow MCP startup)
+        if CLAUDE_DISABLE_MCP:
+            cmd.extend(["--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"])
+        else:
+            mcp_config = get_mcp_config()
+            if mcp_config:
+                cmd.extend(["--mcp-config", json.dumps(mcp_config)])
+
+        # Claude CLI requires --verbose when using --output-format=stream-json with --print/-p
+        cmd.extend([
+            "--verbose",
+            "-p", prompt,
+            "--output-format", "stream-json",
+            "--dangerously-skip-permissions",
+        ])
+
+        _emit_log(trace, "claude.prompt.full", f"prompt={_truncate(prompt, limit=4000)}", level=logging.INFO)
+        _emit_log(trace, "claude.stream.start", f"cmd={_safe_cmd(cmd)}")
+
+        # Start the process (with 4MB buffer limit for image data)
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=4*1024*1024  # 4MB instead of default 64KB
+        )
+
+        # Stream stdout incrementally (NDJSON format)
+        stderr_chunks = []
+        event_count = 0
+
+        # Read stderr in background
+        async def read_stderr():
+            if process.stderr:
+                async for line in process.stderr:
+                    stderr_chunks.append(line)
+
+        stderr_task = asyncio.create_task(read_stderr())
+
+        # Stream stdout as NDJSON events arrive
+        if process.stdout:
+            async for line in process.stdout:
+                try:
+                    line_text = line.decode('utf-8', errors='ignore').strip()
+                    if not line_text:
+                        continue
+
+                    _emit_log(trace, "claude.stream.raw", _truncate(line_text), level=logging.DEBUG)
+                    event = json.loads(line_text)
+                    event_type = event.get('type', 'unknown')
+                    event_count += 1
+
+                    if first_event_at is None:
+                        first_event_at = time.time()
+                        _emit_log(
+                            trace,
+                            "claude.stream.first_event",
+                            f"type={event_type} ttfb={first_event_at - start:.2f}s",
+                            level=logging.INFO,
+                        )
+
+                    _emit_log(
+                        trace,
+                        "claude.stream.event",
+                        f"#{event_count} type={event_type} keys={list(event.keys())}",
+                        level=logging.DEBUG,
+                    )
+
+                    # Handle different event types
+                    if event_type == 'message':
+                        # Extract text content from message events
+                        content = event.get('content', '')
+                        for text in _iter_text_from_content(content):
+                            accumulated_text.append(text)
+                            yield f"data: {json.dumps(make_chunk(text))}\n\n"
+                            emitted_text = True
+                            _emit_log(
+                                trace,
+                                "claude.stream.text",
+                                f"chars={len(text)} preview={_truncate(text)}",
+                                level=logging.DEBUG,
+                            )
+
+                    elif event_type == 'assistant':
+                        # Claude now emits assistant events; handle same as message
+                        message_obj = event.get('message', {})
+                        content = message_obj.get('content', message_obj.get('text', ''))
+                        for text in _iter_text_from_content(content):
+                            accumulated_text.append(text)
+                            yield f"data: {json.dumps(make_chunk(text))}\n\n"
+                            emitted_text = True
+                            _emit_log(
+                                trace,
+                                "claude.stream.assistant_text",
+                                f"chars={len(text)} preview={_truncate(text)}",
+                                level=logging.DEBUG,
+                            )
+
+                    elif event_type == 'tool_use':
+                        tool_name = event.get('name') or event.get('tool') or 'unknown'
+                        _emit_log(trace, "claude.stream.tool_use", f"tool={tool_name} event=#{event_count}")
+
+                    elif event_type == 'tool_result':
+                        summary = event.get('result') or event.get('content') or ''
+                        if isinstance(summary, dict):
+                            summary = f"keys={list(summary.keys())}"
+                        _emit_log(trace, "claude.stream.tool_result", f"event=#{event_count} summary={_truncate(str(summary))}")
+
+                    elif event_type == 'result':
+                        _emit_log(trace, "claude.stream.result", "final result received")
+                        # Fallback: some responses only include final result text
+                        result_text = event.get('result')
+                        if isinstance(result_text, str) and result_text and not emitted_text:
+                            accumulated_text.append(result_text)
+                            yield f"data: {json.dumps(make_chunk(result_text))}\n\n"
+                            _emit_log(
+                                trace,
+                                "claude.stream.result_text",
+                                f"chars={len(result_text)} preview={_truncate(result_text)}",
+                                level=logging.DEBUG,
+                            )
+
+                except json.JSONDecodeError as e:
+                    _emit_log(trace, "claude.stream.json_error", f"line={line_text[:100]} error={e}", level=logging.WARNING)
+                except Exception as e:
+                    _emit_log(trace, "claude.stream.decode_error", str(e), level=logging.WARNING)
+
+        # Wait for process to complete
+        await process.wait()
+        await stderr_task
+
+        elapsed = time.time() - start
+        stderr_text = b''.join(stderr_chunks).decode('utf-8', errors='ignore') if stderr_chunks else ""
+        full_text = ''.join(accumulated_text)
+
+        _emit_log(
+            trace,
+            "claude.stream.done",
+            f"rc={process.returncode} elapsed={elapsed:.2f}s events={event_count} text_len={len(full_text)}",
+        )
+
+        # Handle errors
+        if process.returncode != 0:
+            if session_id and ("session" in stderr_text.lower() or "resume" in stderr_text.lower() or "not found" in stderr_text.lower()):
+                _emit_log(trace, "claude.stream.session_missing", f"session={session_id}")
+                # Retry with history
+                clear_session_id("claude-cli", chat_id)
+                fallback_prompt = history_prompt if history_prompt else prompt
+                fallback_prompt = f"[SYSTEM]\n{MCP_SYSTEM_PROMPT}\n[END SYSTEM]\n\n{fallback_prompt}"
+                _emit_log(trace, "claude.stream.retry.history", "retrying without resume after session miss")
+
+                # Re-stream with fallback
+                async for chunk in stream_claude_incremental(chat_id, None, fallback_prompt, None, trace):
+                    yield chunk
+                return
+            else:
+                error_msg = f"Claude CLI failed: {stderr_text or 'Unknown error'}"
+                yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
+                yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+        # Update session mapping
+        new_session_id = await find_latest_claude_session_id() if not session_id else session_id
+        if new_session_id and new_session_id != session_id:
+            set_session_id("claude-cli", chat_id, new_session_id)
+            _emit_log(trace, "session.map.updated", f"model=claude-cli chat_id={chat_id} session={new_session_id}")
+
+    except Exception as e:
+        error_msg = f"Error: {e}"
+        _emit_log(trace, "claude.stream.error", error_msg, level=logging.ERROR)
+        yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
+
+    yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 async def stream_chat_response(
     model_id: str,
     chat_id: str,
@@ -1025,6 +2094,7 @@ async def stream_chat_response(
     prompt: str,
     history_prompt: Optional[str],
     trace: Optional[Callable[[str, str, int], None]],
+    messages: Optional[List[Dict[str, Any]]] = None,
 ) -> AsyncGenerator[str, None]:
     """Run the model then stream the response preserving newlines."""
     chunk_id = f"chatcmpl-{uuid.uuid4()}"
@@ -1042,7 +2112,23 @@ async def stream_chat_response(
             }]
         }
 
-    # Initial thinking indicator
+    # For claude-api, use true streaming with tools (DISABLED)
+    # if model_id == "claude-api":
+    #     try:
+    #         async for token in stream_claude_api_with_tools(prompt, messages or [], trace):
+    #             yield f"data: {json.dumps(make_chunk(token))}\n\n"
+    #         yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+    #         yield "data: [DONE]\n\n"
+    #         return
+    #     except Exception as e:
+    #         error_msg = f"Error: {e}"
+    #         _emit_log(trace, "stream.error", error_msg, level=logging.ERROR)
+    #         yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
+    #         yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+    #         yield "data: [DONE]\n\n"
+    #         return
+
+    # Initial thinking indicator for CLI models
     yield f"data: {json.dumps(make_chunk('...'))}\n\n"
 
     try:
@@ -1069,6 +2155,496 @@ async def stream_chat_response(
     except Exception as e:
         error_msg = f"Error: {e}"
         _emit_log(trace, "stream.error", error_msg, level=logging.ERROR)
+        yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
+
+    yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+# ============================================================================
+# INTERACTIVE DISCUSSION MODULE - Safe addition, doesn't affect existing models
+# ============================================================================
+
+class DiscussionStage(Enum):
+    SETUP = "setup"
+    INITIAL = "initial"
+    DISCUSSION = "discussion"  # Multi-round interactive stage
+    ROUND1 = "round1"
+    SYNTHESIS = "synthesis"
+    COMPLETE = "complete"
+
+@dataclass
+class DiscussionState:
+    chat_id: str
+    stage: DiscussionStage = DiscussionStage.SETUP
+    topic: str = ""
+    models: List[str] = None
+    mode: str = "collaborate"  # collaborate or debate
+    max_rounds: int = 999  # Effectively unlimited - user decides when to stop
+    current_round: int = 0
+    model_sessions: Dict[str, Optional[str]] = None
+    discussion_history: List[Dict[str, str]] = None
+    waiting_for_user: bool = False
+
+    def __post_init__(self):
+        if self.models is None:
+            self.models = ["claude-cli", "codex-cli"]
+        if self.model_sessions is None:
+            self.model_sessions = {}
+        if self.discussion_history is None:
+            self.discussion_history = []
+
+    def get_model_name(self, model_id: str) -> str:
+        """Get friendly model name"""
+        return model_id.replace("-cli", "").title()
+
+    def add_response(self, model: str, response: str, stage: str):
+        """Add a model response to the discussion history"""
+        self.discussion_history.append({
+            "stage": stage,
+            "model": model,
+            "response": response,
+            "timestamp": time.time()
+        })
+
+# Global discussion states (simple in-memory storage for dev)
+discussion_states: Dict[str, DiscussionState] = {}
+
+def get_discussion_state(chat_id: str) -> Optional[DiscussionState]:
+    """Get discussion state for a chat"""
+    return discussion_states.get(chat_id)
+
+def set_discussion_state(state: DiscussionState):
+    """Save discussion state"""
+    discussion_states[state.chat_id] = state
+
+def clear_discussion_state(chat_id: str):
+    """Clear discussion state"""
+    if chat_id in discussion_states:
+        del discussion_states[chat_id]
+
+def parse_discussion_intent(user_input: str) -> Dict[str, Any]:
+    """Parse user intent for discussion configuration"""
+    config = {
+        "topic": user_input,
+        "models": ["claude-cli", "codex-cli"],
+        "rounds": 2,
+        "mode": "collaborate"
+    }
+
+    input_lower = user_input.lower()
+
+    # Detect mode
+    if any(word in input_lower for word in ["debate", "argue", "disagree", "vs", "versus"]):
+        config["mode"] = "debate"
+
+    # Detect model preferences
+    if "gemini" in input_lower:
+        if "codex" in input_lower:
+            config["models"] = ["gemini-cli", "codex-cli"]
+        else:
+            config["models"] = ["claude-cli", "gemini-cli"]
+
+    # Extract core topic (simple version)
+    topic = user_input
+    if "discuss" in input_lower:
+        parts = user_input.split("discuss", 1)
+        if len(parts) > 1:
+            topic = parts[1].strip()
+
+    config["topic"] = topic if topic else user_input
+    return config
+
+def format_discussion_prompt(topic: str, mode: str, is_initial: bool = True, other_response: str = "") -> str:
+    """Format prompts for discussion"""
+    if is_initial:
+        if mode == "debate":
+            return f"""You are participating in a debate about: "{topic}"
+
+Take a clear position and provide your strongest arguments. Be intellectually rigorous but respectful.
+
+Your analysis:"""
+        else:
+            return f"""You are collaborating on analyzing: "{topic}"
+
+Provide your expertise and perspective. Focus on constructive analysis and suggestions.
+
+Your analysis:"""
+    else:
+        # Response to other model - ENHANCED for deeper engagement
+        if mode == "debate":
+            return f"""Your colleague just argued:
+
+"{other_response}"
+
+Now respond to their points:
+- Challenge any claims you disagree with (provide reasoning)
+- Acknowledge points where they're correct
+- Present counter-arguments or alternative perspectives
+- Ask clarifying questions if needed
+
+Your rebuttal:"""
+        else:
+            return f"""Your colleague shared this analysis:
+
+"{other_response}"
+
+Build on their contribution:
+- Identify points you agree with and why
+- Add complementary perspectives they may have missed
+- Address any gaps or concerns you see
+- Suggest how to combine both viewpoints
+
+Your response:"""
+
+async def handle_interactive_discussion(request: Request, body: ChatCompletionRequest):
+    """Handle interactive discussion mode - SAFE: only called for interactive-discussion model"""
+    trace_id, trace = _make_trace_logger()
+    chat_id = get_chat_id(request, body.messages)
+
+    # Get or create discussion state
+    state = get_discussion_state(chat_id)
+    user_input = body.messages[-1].content if body.messages else ""
+
+    logger.info(f"[{trace}] interactive_discussion.request | chat_id={chat_id} input='{user_input[:50]}...' has_state={state is not None} stage={state.stage.value if state else 'none'}")
+
+    if body.stream:
+        return StreamingResponse(
+            stream_interactive_discussion(
+                chat_id=chat_id,
+                user_input=user_input,
+                state=state,
+                trace=trace,
+            ),
+            media_type="text/event-stream",
+        )
+    else:
+        # Simple non-streaming response for testing
+        result = "Interactive discussion mode active. Use streaming for full experience."
+        return {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "interactive-discussion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": result},
+                "finish_reason": "stop"
+            }]
+        }
+
+async def stream_interactive_discussion(
+    chat_id: str,
+    user_input: str,
+    state: Optional[DiscussionState],
+    trace: Optional[Callable] = None,
+) -> AsyncGenerator[str, None]:
+    """Stream interactive discussion - MINIMAL VERSION for testing"""
+
+    chunk_id = f"chatcmpl-{uuid.uuid4()}"
+
+    def make_chunk(content: str, finish: bool = False):
+        return {
+            "id": chunk_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "interactive-discussion",
+            "choices": [{
+                "index": 0,
+                "delta": {} if finish else {"content": content},
+                "finish_reason": "stop" if finish else None
+            }]
+        }
+
+    try:
+        # Handle setup stage
+        if not state or state.stage == DiscussionStage.SETUP:
+            # Parse discussion request
+            config = parse_discussion_intent(user_input)
+
+            # Create new state
+            state = DiscussionState(
+                chat_id=chat_id,
+                topic=config["topic"],
+                models=config["models"],
+                mode=config["mode"]
+            )
+            set_discussion_state(state)
+
+            # Show setup
+            model_names = [state.get_model_name(m) for m in state.models]
+            yield f"data: {json.dumps(make_chunk(f'🎭 **Interactive Discussion Setup**\\n\\n'))}\n\n"
+            yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\\n'))}\n\n"
+            participants_text = ' vs '.join(model_names)
+            yield f"data: {json.dumps(make_chunk(f'**Participants:** {participants_text}\\n'))}\n\n"
+            yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\\n\\n'))}\n\n"
+
+            # Move to initial stage
+            state.stage = DiscussionStage.INITIAL
+            set_discussion_state(state)
+
+            yield f"data: {json.dumps(make_chunk('Type **\"start\"** to begin, or **\"cancel\"** to end.\\n\\n'))}\n\n"
+
+        elif state.stage == DiscussionStage.INITIAL:
+            user_command = user_input.lower().strip()
+
+            if user_command == "cancel":
+                clear_discussion_state(chat_id)
+                yield f"data: {json.dumps(make_chunk('Discussion cancelled. 👋'))}\n\n"
+            elif user_command == "start":
+                # Run initial analysis
+                yield f"data: {json.dumps(make_chunk(f'🎬 **Starting Discussion: {state.topic}**\\n\\n'))}\n\n"
+
+                # Get responses from both models
+                for i, model in enumerate(state.models):
+                    model_name = state.get_model_name(model)
+                    icon = "🔵" if i == 0 else "🟡"
+
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} analyzing...**\\n'))}\n\n"
+
+                    prompt = format_discussion_prompt(state.topic, state.mode, is_initial=True)
+                    response, session = await call_model_prompt(
+                        model_id=model,
+                        prompt=prompt,
+                        session_id=get_session_id(model, chat_id),
+                        history_prompt=None,
+                        chat_id=chat_id,
+                        trace=trace,
+                    )
+
+                    if session:
+                        set_session_id(model, chat_id, session)
+
+                    state.add_response(model, response, "initial")
+                    yield f"data: {json.dumps(make_chunk(f'{response}\\n\\n'))}\n\n"
+
+                # Move to discussion rounds for interactive exchange
+                state.current_round = 1
+                state.stage = DiscussionStage.DISCUSSION
+                set_discussion_state(state)
+
+                if state.max_rounds > 1:
+                    yield f"data: {json.dumps(make_chunk(f'\\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, **\"export\"** for summary, or **\"stop\"** to end.\\n\\n'))}\n\n"
+                else:
+                    state.stage = DiscussionStage.SYNTHESIS
+                    set_discussion_state(state)
+                    yield f"data: {json.dumps(make_chunk('\\n**Discussion complete!** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+            else:
+                yield f"data: {json.dumps(make_chunk('Please type **\"start\"** or **\"cancel\"**.'))}\n\n"
+
+        elif state.stage == DiscussionStage.DISCUSSION:
+            user_command = user_input.lower().strip()
+            logger.info(f"[{trace}] discussion.command | chat_id={chat_id} cmd={user_command} stage={state.stage.value} round={state.current_round}")
+
+            if user_command == "stop":
+                state.stage = DiscussionStage.SYNTHESIS
+                set_discussion_state(state)
+                yield f"data: {json.dumps(make_chunk('**Discussion ended.** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+
+            elif user_command == "export":
+                # User wants to export immediately from DISCUSSION stage
+                logger.info(f"[{trace}] discussion.export | chat_id={chat_id} round={state.current_round} entries={len(state.discussion_history)}")
+                # Generate the export with summary directly
+                yield f"data: {json.dumps(make_chunk('📋 **Discussion Export**\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Rounds:** {state.current_round}\\n\\n'))}\n\n"
+
+                yield f"data: {json.dumps(make_chunk('---\\n\\n## Round-by-Round Discussion\\n\\n'))}\n\n"
+
+                for entry in state.discussion_history:
+                    model_name = state.get_model_name(entry["model"])
+                    response_text = entry["response"]
+                    round_info = entry.get("stage", "")
+                    yield f"data: {json.dumps(make_chunk(f'**{model_name}** ({round_info}):\\n{response_text}\\n\\n'))}\n\n"
+
+                # Generate AI summary using Claude
+                yield f"data: {json.dumps(make_chunk('---\\n\\n## 🤖 AI-Generated Summary\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('*Analyzing discussion...*\\n\\n'))}\n\n"
+
+                # Build summary prompt with full discussion history
+                summary_parts = [f"Summarize this discussion about: {state.topic}\\n\\n"]
+                summary_parts.append(f"Mode: {state.mode}\\n")
+                summary_parts.append(f"Total rounds: {state.current_round}\\n\\n")
+                summary_parts.append("Discussion transcript:\\n")
+
+                for entry in state.discussion_history:
+                    model_name = state.get_model_name(entry["model"])
+                    response_text = entry["response"]
+                    # Truncate very long responses for summary prompt
+                    if len(response_text) > 1000:
+                        response_text = response_text[:1000] + "... [truncated]"
+                    summary_parts.append(f"{model_name}: {response_text}\\n\\n")
+
+                summary_parts.append("""
+Please provide:
+1. **Key Points of Agreement**: What did both models agree on?
+2. **Key Points of Disagreement**: Where did they differ?
+3. **Evolution**: How did positions change across rounds?
+4. **Conclusion**: What's the synthesized recommendation or outcome?
+
+Keep it concise (3-5 paragraphs).""")
+
+                summary_prompt = "".join(summary_parts)
+
+                # Call Claude to generate summary
+                try:
+                    summary_response, _ = await call_model_prompt(
+                        model_id="claude-cli",
+                        prompt=summary_prompt,
+                        session_id=None,  # Don't use discussion session
+                        history_prompt=None,
+                        chat_id=chat_id + "_summary",  # Different chat for summary
+                        trace=trace,
+                    )
+
+                    yield f"data: {json.dumps(make_chunk(summary_response))}\\n\\n"
+                except Exception as e:
+                    yield f"data: {json.dumps(make_chunk(f'*Summary generation failed: {str(e)}*'))}\\n\\n"
+
+                yield f"data: {json.dumps(make_chunk('\\n---\\n\\n*Export complete. Discussion ended.*\\n\\n'))}\n\n"
+                clear_discussion_state(chat_id)
+
+            elif user_command == "continue":
+                # Check if we've hit max rounds
+                if state.current_round >= state.max_rounds:
+                    state.stage = DiscussionStage.SYNTHESIS
+                    set_discussion_state(state)
+                    yield f"data: {json.dumps(make_chunk(f'**Maximum rounds ({state.max_rounds}) reached.** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+                else:
+                    # Run next round - models respond to each other
+                    state.current_round += 1
+                    yield f"data: {json.dumps(make_chunk(f'\\n🔄 **Round {state.current_round}** - Models responding to each other...\\n\\n'))}\n\n"
+
+                    # Each model responds to the OTHER model's last response
+                    for i, model in enumerate(state.models):
+                        model_name = state.get_model_name(model)
+                        other_model = state.models[1 - i]  # Get the other model
+                        icon = "🔵" if i == 0 else "🟡"
+
+                        # Find the other model's most recent response
+                        other_response = None
+                        for entry in reversed(state.discussion_history):
+                            if entry["model"] == other_model:
+                                other_response = entry["response"]
+                                break
+
+                        if not other_response:
+                            continue
+
+                        # Truncate other_response if too long (keep it under 2000 chars for context)
+                        if len(other_response) > 2000:
+                            other_response = other_response[:2000] + "\\n\\n[...response truncated for brevity...]"
+
+                        yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} responding to {state.get_model_name(other_model)}...**\\n'))}\n\n"
+
+                        # Format prompt with the other model's response
+                        prompt = format_discussion_prompt(
+                            state.topic,
+                            state.mode,
+                            is_initial=False,  # This is a follow-up
+                            other_response=other_response
+                        )
+
+                        response, session = await call_model_prompt(
+                            model_id=model,
+                            prompt=prompt,
+                            session_id=get_session_id(model, chat_id),
+                            history_prompt=None,
+                            chat_id=chat_id,
+                            trace=trace,
+                        )
+
+                        if session:
+                            set_session_id(model, chat_id, session)
+
+                        state.add_response(model, response, f"round_{state.current_round}")
+                        yield f"data: {json.dumps(make_chunk(f'{response}\\n\\n'))}\n\n"
+
+                    # Offer to continue or stop
+                    set_discussion_state(state)
+                    if state.current_round >= state.max_rounds:
+                        state.stage = DiscussionStage.SYNTHESIS
+                        yield f"data: {json.dumps(make_chunk(f'\\n**Discussion complete ({state.max_rounds} rounds).** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+                    else:
+                        yield f"data: {json.dumps(make_chunk(f'\\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, **\"export\"** for summary, or **\"stop\"** to end.\\n\\n'))}\n\n"
+            else:
+                yield f"data: {json.dumps(make_chunk('Please type **\"continue\"**, **\"stop\"**, or **\"export\"**.'))}\n\n"
+
+        elif state.stage == DiscussionStage.SYNTHESIS:
+            user_command = user_input.lower().strip()
+            logger.info(f"[{trace}] synthesis.command | chat_id={chat_id} cmd={user_command} stage={state.stage.value}")
+
+            if user_command == "export":
+                # Export with AI-generated summary
+                logger.info(f"[{trace}] synthesis.export | chat_id={chat_id} round={state.current_round} entries={len(state.discussion_history)}")
+                yield f"data: {json.dumps(make_chunk('📋 **Discussion Export**\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Rounds:** {state.current_round}\\n\\n'))}\n\n"
+
+                yield f"data: {json.dumps(make_chunk('---\\n\\n## Round-by-Round Discussion\\n\\n'))}\n\n"
+
+                for entry in state.discussion_history:
+                    model_name = state.get_model_name(entry["model"])
+                    response_text = entry["response"]
+                    round_info = entry.get("stage", "")
+                    yield f"data: {json.dumps(make_chunk(f'**{model_name}** ({round_info}):\\n{response_text}\\n\\n'))}\n\n"
+
+                # Generate AI summary using Claude
+                yield f"data: {json.dumps(make_chunk('---\\n\\n## 🤖 AI-Generated Summary\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('*Analyzing discussion...*\\n\\n'))}\n\n"
+
+                # Build summary prompt with full discussion history
+                summary_parts = [f"Summarize this discussion about: {state.topic}\\n\\n"]
+                summary_parts.append(f"Mode: {state.mode}\\n")
+                summary_parts.append(f"Total rounds: {state.current_round}\\n\\n")
+                summary_parts.append("Discussion transcript:\\n")
+
+                for entry in state.discussion_history:
+                    model_name = state.get_model_name(entry["model"])
+                    response_text = entry["response"]
+                    # Truncate very long responses for summary prompt
+                    if len(response_text) > 1000:
+                        response_text = response_text[:1000] + "... [truncated]"
+                    summary_parts.append(f"{model_name}: {response_text}\\n\\n")
+
+                summary_parts.append("""
+Please provide:
+1. **Key Points of Agreement**: What did both models agree on?
+2. **Key Points of Disagreement**: Where did they differ?
+3. **Evolution**: How did positions change across rounds?
+4. **Conclusion**: What's the synthesized recommendation or outcome?
+
+Keep it concise (3-5 paragraphs).""")
+
+                summary_prompt = "".join(summary_parts)
+
+                # Call Claude to generate summary
+                try:
+                    summary_response, _ = await call_model_prompt(
+                        model_id="claude-cli",
+                        prompt=summary_prompt,
+                        session_id=None,  # Don't use discussion session
+                        history_prompt=None,
+                        chat_id=chat_id + "_summary",  # Different chat for summary
+                        trace=trace,
+                    )
+
+                    yield f"data: {json.dumps(make_chunk(summary_response))}\\n\\n"
+                except Exception as e:
+                    yield f"data: {json.dumps(make_chunk(f'*Summary generation failed: {str(e)}*'))}\\n\\n"
+
+                yield f"data: {json.dumps(make_chunk('\\n---\\n\\n*Export complete. Discussion ended.*\\n\\n'))}\n\n"
+                clear_discussion_state(chat_id)
+            else:
+                # Unexpected input in SYNTHESIS stage
+                logger.warning(f"[{trace}] synthesis.unexpected | chat_id={chat_id} input='{user_command}' expected='export'")
+                yield f"data: {json.dumps(make_chunk(f'**Invalid command in synthesis stage:** "{user_command}"\\n\\nPlease type exactly **\"export\"** to generate summary.\\n\\n'))}\n\n"
+
+    except Exception as e:
+        error_msg = f"Discussion error: {str(e)}"
+        _emit_log(trace, "interactive_discussion.error", str(e), level=logging.ERROR)
         yield f"data: {json.dumps(make_chunk(error_msg))}\n\n"
 
     yield f"data: {json.dumps(make_chunk('', finish=True))}\n\n"
