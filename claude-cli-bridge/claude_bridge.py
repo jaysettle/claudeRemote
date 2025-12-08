@@ -863,13 +863,9 @@ def normalize_codex_response(text: str) -> str:
 
 
 def is_followup_prompt(text: str) -> bool:
-    """Detect Open WebUI follow-up generator prompt."""
-    t = text.lower()
-    return (
-        "suggest 3-5 relevant follow-up questions" in t
-        and '"follow_ups"' in text
-        and "json format" in t
-    )
+    """Detect Open WebUI follow-up generator prompt (works with custom prompts)."""
+    # Check for JSON follow_ups format requirement - works with any prompt that asks for JSON
+    return '"follow_ups"' in text
 
 
 def extract_followups(text: str) -> List[str]:
@@ -904,10 +900,12 @@ def extract_followups(text: str) -> List[str]:
 
 def is_error_response(text: str) -> bool:
     """Check if response is an error (Claude CLI puts errors in stdout with exit code 0)"""
+    # Only check for CLI-specific error patterns, not generic "Error:" which appears in normal content
     error_patterns = [
         "No conversation found with session ID:",
-        "Error:",
         "not a valid UUID",
+        "Error: Invalid",  # Claude CLI specific errors start with "Error: Invalid..."
+        "Error: Could not",  # Another Claude CLI pattern
     ]
     return any(pattern in text for pattern in error_patterns)
 
@@ -1048,7 +1046,7 @@ async def run_codex_prompt(
         if followup_prompt:
             followups = extract_followups(response_text)
             if followups:
-                response_text = "\n".join(f"- {f}" for f in followups)
+                response_text = json.dumps({"follow_ups": followups})
             else:
                 response_text = normalize_codex_response(response_text)
         else:
@@ -1694,11 +1692,22 @@ async def chat_completions(request: Request, body: ChatCompletionRequest):
                     media_type="text/event-stream",
                 )
         else:
-            # TEMPORARY: Skip follow-up generation because Claude CLI -p mode is hanging
+            # Use codex-cli for follow-up generation (faster, uses OpenAI)
             if is_followup_prompt(final_message):
-                trace("followup.skipped", "returning empty follow-ups (CLI -p mode broken)")
-                response_text = '{"follow_ups": []}'
-                new_session_id = session_id
+                trace("followup.codex", "routing follow-up to codex-cli")
+                try:
+                    response_text, _ = await run_codex_prompt(
+                        prompt=final_message,
+                        session_id=None,  # No session needed for follow-ups
+                        timeout=30,  # Short timeout for follow-ups
+                        trace=trace,
+                        followup_prompt=True,
+                    )
+                    new_session_id = session_id
+                except Exception as e:
+                    trace("followup.error", f"codex failed: {e}, returning empty")
+                    response_text = '{"follow_ups": []}'
+                    new_session_id = session_id
             else:
                 response_text, new_session_id = await call_model_prompt(
                     model_id=model_id,
@@ -2245,23 +2254,49 @@ def parse_discussion_intent(user_input: str) -> Dict[str, Any]:
         else:
             config["models"] = ["claude-cli", "gemini-cli"]
 
-    # Extract core topic (simple version)
+    # Extract core topic - only strip known command words if they appear as the FIRST word
     topic = user_input
-    if "discuss" in input_lower:
-        parts = user_input.split("discuss", 1)
-        if len(parts) > 1:
-            topic = parts[1].strip()
+    first_word_raw = input_lower.strip().split()[0] if input_lower.strip() else ""
+    # Strip common punctuation from first word for matching (debate: → debate)
+    first_word = first_word_raw.rstrip(':,;.!?')
+
+    # Known command words that should be stripped from the beginning
+    command_words = ["discuss", "debate", "analyze", "compare"]
+
+    if first_word in command_words:
+        # Remove the first word and use the rest as topic
+        words = user_input.strip().split(None, 1)
+        topic = words[1] if len(words) > 1 else user_input
+    else:
+        # Use entire input as topic
+        topic = user_input
+
+    logger.info(f"parse_discussion_intent | first_word='{first_word}' | topic='{topic[:100]}...'")
 
     config["topic"] = topic if topic else user_input
     return config
 
-def format_discussion_prompt(topic: str, mode: str, is_initial: bool = True, other_response: str = "") -> str:
+def build_discussion_history_prompt(state: DiscussionState) -> str:
+    """Build a history prompt with full discussion context for session fallback"""
+    history_parts = []
+    history_parts.append(f"[Original Topic]\n{state.topic}\n")
+    history_parts.append(f"\n[Discussion History - {state.current_round} rounds]\n")
+
+    for entry in state.discussion_history[-10:]:  # Last 10 entries
+        model_name = state.get_model_name(entry["model"])
+        response = entry["response"]
+        if len(response) > 800:
+            response = response[:800] + "... [truncated]"
+        history_parts.append(f"\n{model_name}: {response}\n")
+
+    return "\n".join(history_parts)
+
+def format_discussion_prompt(topic: str, mode: str, is_initial: bool = True, other_response: str = "", user_guidance: str = "", debate_position: str = "") -> str:
     """Format prompts for discussion"""
     if is_initial:
         if mode == "debate":
-            return f"""You are participating in a debate about: "{topic}"
-
-Take a clear position and provide your strongest arguments. Be intellectually rigorous but respectful.
+            position_instruction = f"\n\nYou must argue FOR: {debate_position}" if debate_position else "\n\nTake a clear position and provide your strongest arguments."
+            return f"""You are participating in a debate about: "{topic}"{position_instruction} Be intellectually rigorous but respectful.
 
 Your analysis:"""
         else:
@@ -2272,8 +2307,36 @@ Provide your expertise and perspective. Focus on constructive analysis and sugge
 Your analysis:"""
     else:
         # Response to other model - ENHANCED for deeper engagement
-        if mode == "debate":
-            return f"""Your colleague just argued:
+        # If user provided guidance, incorporate it into the prompt
+        if user_guidance:
+            if mode == "debate":
+                return f"""The user has provided this guidance: "{user_guidance}"
+
+Your colleague's previous response:
+"{other_response}"
+
+Now respond to BOTH the user's guidance AND your colleague's points:
+- Address the user's question or direction
+- Challenge or support your colleague's relevant points
+- Present your perspective on the user's guidance
+
+Your response:"""
+            else:
+                return f"""The user has provided this guidance: "{user_guidance}"
+
+Your colleague's previous response:
+"{other_response}"
+
+Please respond to BOTH the user's guidance AND build on your colleague's analysis:
+- Address the user's question or direction
+- Integrate your colleague's relevant points
+- Add your own perspective and expertise
+
+Your response:"""
+        else:
+            # No user guidance - models respond to each other
+            if mode == "debate":
+                return f"""Your colleague just argued:
 
 "{other_response}"
 
@@ -2284,8 +2347,8 @@ Now respond to their points:
 - Ask clarifying questions if needed
 
 Your rebuttal:"""
-        else:
-            return f"""Your colleague shared this analysis:
+            else:
+                return f"""Your colleague shared this analysis:
 
 "{other_response}"
 
@@ -2373,17 +2436,21 @@ async def stream_interactive_discussion(
 
             # Show setup
             model_names = [state.get_model_name(m) for m in state.models]
-            yield f"data: {json.dumps(make_chunk(f'🎭 **Interactive Discussion Setup**\\n\\n'))}\n\n"
-            yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\\n'))}\n\n"
+            yield f"data: {json.dumps(make_chunk(f'🎭 **Interactive Discussion Setup**\n\n'))}\n\n"
+            # Truncate topic for display (first 200 chars or first line)
+            topic_display = state.topic.split('\n')[0][:200]
+            if len(state.topic) > 200 or '\n' in state.topic:
+                topic_display += "..."
+            yield f"data: {json.dumps(make_chunk(f'**Topic:** {topic_display}\n'))}\n\n"
             participants_text = ' vs '.join(model_names)
-            yield f"data: {json.dumps(make_chunk(f'**Participants:** {participants_text}\\n'))}\n\n"
-            yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\\n\\n'))}\n\n"
+            yield f"data: {json.dumps(make_chunk(f'**Participants:** {participants_text}\n'))}\n\n"
+            yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\n\n'))}\n\n"
 
             # Move to initial stage
             state.stage = DiscussionStage.INITIAL
             set_discussion_state(state)
 
-            yield f"data: {json.dumps(make_chunk('Type **\"start\"** to begin, or **\"cancel\"** to end.\\n\\n'))}\n\n"
+            yield f"data: {json.dumps(make_chunk('Type **\"start\"** to begin, or **\"cancel\"** to end.\n\n'))}\n\n"
 
         elif state.stage == DiscussionStage.INITIAL:
             user_command = user_input.lower().strip()
@@ -2393,16 +2460,31 @@ async def stream_interactive_discussion(
                 yield f"data: {json.dumps(make_chunk('Discussion cancelled. 👋'))}\n\n"
             elif user_command == "start":
                 # Run initial analysis
-                yield f"data: {json.dumps(make_chunk(f'🎬 **Starting Discussion: {state.topic}**\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'🎬 **Starting Discussion: {state.topic}**\n\n'))}\n\n"
 
                 # Get responses from both models
                 for i, model in enumerate(state.models):
                     model_name = state.get_model_name(model)
                     icon = "🔵" if i == 0 else "🟡"
 
-                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} analyzing...**\\n'))}\n\n"
+                    # For debate mode, try to assign opposing positions from topic
+                    debate_position = ""
+                    if state.mode == "debate" and " or " in state.topic.lower():
+                        # Extract "X or Y" pattern and assign positions
+                        parts = state.topic.lower().split(" or ", 1)
+                        if len(parts) == 2:
+                            # First model gets first option, second model gets second option
+                            option1 = parts[0].split()[-1] if parts[0].split() else parts[0]  # Last word before "or"
+                            option2 = parts[1].split()[0] if parts[1].split() else parts[1]   # First word after "or"
+                            debate_position = option1 if i == 0 else option2
 
-                    prompt = format_discussion_prompt(state.topic, state.mode, is_initial=True)
+                    # Show which position this model will argue for
+                    if debate_position:
+                        yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} analyzing... (arguing for: {debate_position})**\n'))}\n\n"
+                    else:
+                        yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} analyzing...**\n'))}\n\n"
+
+                    prompt = format_discussion_prompt(state.topic, state.mode, is_initial=True, debate_position=debate_position)
                     response, session = await call_model_prompt(
                         model_id=model,
                         prompt=prompt,
@@ -2416,7 +2498,7 @@ async def stream_interactive_discussion(
                         set_session_id(model, chat_id, session)
 
                     state.add_response(model, response, "initial")
-                    yield f"data: {json.dumps(make_chunk(f'{response}\\n\\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
 
                 # Move to discussion rounds for interactive exchange
                 state.current_round = 1
@@ -2424,11 +2506,11 @@ async def stream_interactive_discussion(
                 set_discussion_state(state)
 
                 if state.max_rounds > 1:
-                    yield f"data: {json.dumps(make_chunk(f'\\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, **\"export\"** for summary, or **\"stop\"** to end.\\n\\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide your own guidance/question, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
                 else:
                     state.stage = DiscussionStage.SYNTHESIS
                     set_discussion_state(state)
-                    yield f"data: {json.dumps(make_chunk('\\n**Discussion complete!** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk('\n**Discussion complete!** Type **\"export\"** for summary.\n\n'))}\n\n"
             else:
                 yield f"data: {json.dumps(make_chunk('Please type **\"start\"** or **\"cancel\"**.'))}\n\n"
 
@@ -2439,34 +2521,34 @@ async def stream_interactive_discussion(
             if user_command == "stop":
                 state.stage = DiscussionStage.SYNTHESIS
                 set_discussion_state(state)
-                yield f"data: {json.dumps(make_chunk('**Discussion ended.** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('**Discussion ended.** Type **\"export\"** for summary.\n\n'))}\n\n"
 
             elif user_command == "export":
                 # User wants to export immediately from DISCUSSION stage
                 logger.info(f"[{trace}] discussion.export | chat_id={chat_id} round={state.current_round} entries={len(state.discussion_history)}")
                 # Generate the export with summary directly
-                yield f"data: {json.dumps(make_chunk('📋 **Discussion Export**\\n\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\\n\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk(f'**Rounds:** {state.current_round}\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('📋 **Discussion Export**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Rounds:** {state.current_round}\n\n'))}\n\n"
 
-                yield f"data: {json.dumps(make_chunk('---\\n\\n## Round-by-Round Discussion\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('---\n\n## Round-by-Round Discussion\n\n'))}\n\n"
 
                 for entry in state.discussion_history:
                     model_name = state.get_model_name(entry["model"])
                     response_text = entry["response"]
                     round_info = entry.get("stage", "")
-                    yield f"data: {json.dumps(make_chunk(f'**{model_name}** ({round_info}):\\n{response_text}\\n\\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'**{model_name}** ({round_info}):\n{response_text}\n\n'))}\n\n"
 
                 # Generate AI summary using Claude
-                yield f"data: {json.dumps(make_chunk('---\\n\\n## 🤖 AI-Generated Summary\\n\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('*Analyzing discussion...*\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('---\n\n## 🤖 AI-Generated Summary\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('*Analyzing discussion...*\n\n'))}\n\n"
 
                 # Build summary prompt with full discussion history
-                summary_parts = [f"Summarize this discussion about: {state.topic}\\n\\n"]
-                summary_parts.append(f"Mode: {state.mode}\\n")
-                summary_parts.append(f"Total rounds: {state.current_round}\\n\\n")
-                summary_parts.append("Discussion transcript:\\n")
+                summary_parts = [f"Summarize this discussion about: {state.topic}\n\n"]
+                summary_parts.append(f"Mode: {state.mode}\n")
+                summary_parts.append(f"Total rounds: {state.current_round}\n\n")
+                summary_parts.append("Discussion transcript:\n")
 
                 for entry in state.discussion_history:
                     model_name = state.get_model_name(entry["model"])
@@ -2474,7 +2556,7 @@ async def stream_interactive_discussion(
                     # Truncate very long responses for summary prompt
                     if len(response_text) > 1000:
                         response_text = response_text[:1000] + "... [truncated]"
-                    summary_parts.append(f"{model_name}: {response_text}\\n\\n")
+                    summary_parts.append(f"{model_name}: {response_text}\n\n")
 
                 summary_parts.append("""
 Please provide:
@@ -2498,11 +2580,11 @@ Keep it concise (3-5 paragraphs).""")
                         trace=trace,
                     )
 
-                    yield f"data: {json.dumps(make_chunk(summary_response))}\\n\\n"
+                    yield f"data: {json.dumps(make_chunk(summary_response))}\n\n"
                 except Exception as e:
-                    yield f"data: {json.dumps(make_chunk(f'*Summary generation failed: {str(e)}*'))}\\n\\n"
+                    yield f"data: {json.dumps(make_chunk(f'*Summary generation failed: {str(e)}*'))}\n\n"
 
-                yield f"data: {json.dumps(make_chunk('\\n---\\n\\n*Export complete. Discussion ended.*\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('\n---\n\n*Export complete. Discussion ended.*\n\n'))}\n\n"
                 clear_discussion_state(chat_id)
 
             elif user_command == "continue":
@@ -2510,11 +2592,11 @@ Keep it concise (3-5 paragraphs).""")
                 if state.current_round >= state.max_rounds:
                     state.stage = DiscussionStage.SYNTHESIS
                     set_discussion_state(state)
-                    yield f"data: {json.dumps(make_chunk(f'**Maximum rounds ({state.max_rounds}) reached.** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'**Maximum rounds ({state.max_rounds}) reached.** Type **\"export\"** for summary.\n\n'))}\n\n"
                 else:
-                    # Run next round - models respond to each other
+                    # Run next round - models respond to each other (no user guidance)
                     state.current_round += 1
-                    yield f"data: {json.dumps(make_chunk(f'\\n🔄 **Round {state.current_round}** - Models responding to each other...\\n\\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'\n🔄 **Round {state.current_round}** - Models responding to each other...\n\n'))}\n\n"
 
                     # Each model responds to the OTHER model's last response
                     for i, model in enumerate(state.models):
@@ -2534,11 +2616,11 @@ Keep it concise (3-5 paragraphs).""")
 
                         # Truncate other_response if too long (keep it under 2000 chars for context)
                         if len(other_response) > 2000:
-                            other_response = other_response[:2000] + "\\n\\n[...response truncated for brevity...]"
+                            other_response = other_response[:2000] + "\n\n[...response truncated for brevity...]"
 
-                        yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} responding to {state.get_model_name(other_model)}...**\\n'))}\n\n"
+                        yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} responding to {state.get_model_name(other_model)}...**\n'))}\n\n"
 
-                        # Format prompt with the other model's response
+                        # Format prompt with the other model's response (no user guidance)
                         prompt = format_discussion_prompt(
                             state.topic,
                             state.mode,
@@ -2546,11 +2628,14 @@ Keep it concise (3-5 paragraphs).""")
                             other_response=other_response
                         )
 
+                        # Build history prompt for fallback if session is lost
+                        history_prompt = build_discussion_history_prompt(state) + "\n\n" + prompt
+
                         response, session = await call_model_prompt(
                             model_id=model,
                             prompt=prompt,
                             session_id=get_session_id(model, chat_id),
-                            history_prompt=None,
+                            history_prompt=history_prompt,
                             chat_id=chat_id,
                             trace=trace,
                         )
@@ -2559,17 +2644,73 @@ Keep it concise (3-5 paragraphs).""")
                             set_session_id(model, chat_id, session)
 
                         state.add_response(model, response, f"round_{state.current_round}")
-                        yield f"data: {json.dumps(make_chunk(f'{response}\\n\\n'))}\n\n"
+                        yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
 
                     # Offer to continue or stop
                     set_discussion_state(state)
                     if state.current_round >= state.max_rounds:
                         state.stage = DiscussionStage.SYNTHESIS
-                        yield f"data: {json.dumps(make_chunk(f'\\n**Discussion complete ({state.max_rounds} rounds).** Type **\"export\"** for summary.\\n\\n'))}\n\n"
+                        yield f"data: {json.dumps(make_chunk(f'\n**Discussion complete ({state.max_rounds} rounds).** Type **\"export\"** for summary.\n\n'))}\n\n"
                     else:
-                        yield f"data: {json.dumps(make_chunk(f'\\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, **\"export\"** for summary, or **\"stop\"** to end.\\n\\n'))}\n\n"
+                        yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
             else:
-                yield f"data: {json.dumps(make_chunk('Please type **\"continue\"**, **\"stop\"**, or **\"export\"**.'))}\n\n"
+                # User provided free-form guidance instead of a command
+                user_guidance = user_input  # Use the original input, not lowercased
+                state.current_round += 1
+                yield f"data: {json.dumps(make_chunk(f'\n💬 **Round {state.current_round}** - User guidance: "{user_guidance[:100]}{"..." if len(user_guidance) > 100 else ""}"\n\n'))}\n\n"
+
+                # Both models respond to user's guidance
+                for i, model in enumerate(state.models):
+                    model_name = state.get_model_name(model)
+                    other_model = state.models[1 - i]
+                    icon = "🔵" if i == 0 else "🟡"
+
+                    # Find the other model's most recent response for context
+                    other_response = None
+                    for entry in reversed(state.discussion_history):
+                        if entry["model"] == other_model:
+                            other_response = entry["response"]
+                            break
+
+                    if not other_response:
+                        other_response = "(No previous response from colleague)"
+
+                    # Truncate other_response if too long
+                    if len(other_response) > 2000:
+                        other_response = other_response[:2000] + "\n\n[...response truncated for brevity...]"
+
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} responding to user guidance...**\n'))}\n\n"
+
+                    # Format prompt with user guidance AND other model's response
+                    prompt = format_discussion_prompt(
+                        state.topic,
+                        state.mode,
+                        is_initial=False,
+                        other_response=other_response,
+                        user_guidance=user_guidance  # Pass user's guidance
+                    )
+
+                    # Build history prompt for fallback if session is lost
+                    history_prompt = build_discussion_history_prompt(state) + "\n\n" + prompt
+
+                    response, session = await call_model_prompt(
+                        model_id=model,
+                        prompt=prompt,
+                        session_id=get_session_id(model, chat_id),
+                        history_prompt=history_prompt,
+                        chat_id=chat_id,
+                        trace=trace,
+                    )
+
+                    if session:
+                        set_session_id(model, chat_id, session)
+
+                    state.add_response(model, response, f"round_{state.current_round}_user_guided")
+                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+
+                # Offer to continue or stop
+                set_discussion_state(state)
+                yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide guidance, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
 
         elif state.stage == DiscussionStage.SYNTHESIS:
             user_command = user_input.lower().strip()
@@ -2578,28 +2719,28 @@ Keep it concise (3-5 paragraphs).""")
             if user_command == "export":
                 # Export with AI-generated summary
                 logger.info(f"[{trace}] synthesis.export | chat_id={chat_id} round={state.current_round} entries={len(state.discussion_history)}")
-                yield f"data: {json.dumps(make_chunk('📋 **Discussion Export**\\n\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\\n\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk(f'**Rounds:** {state.current_round}\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('📋 **Discussion Export**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Topic:** {state.topic}\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Mode:** {state.mode.title()}\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Rounds:** {state.current_round}\n\n'))}\n\n"
 
-                yield f"data: {json.dumps(make_chunk('---\\n\\n## Round-by-Round Discussion\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('---\n\n## Round-by-Round Discussion\n\n'))}\n\n"
 
                 for entry in state.discussion_history:
                     model_name = state.get_model_name(entry["model"])
                     response_text = entry["response"]
                     round_info = entry.get("stage", "")
-                    yield f"data: {json.dumps(make_chunk(f'**{model_name}** ({round_info}):\\n{response_text}\\n\\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'**{model_name}** ({round_info}):\n{response_text}\n\n'))}\n\n"
 
                 # Generate AI summary using Claude
-                yield f"data: {json.dumps(make_chunk('---\\n\\n## 🤖 AI-Generated Summary\\n\\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('*Analyzing discussion...*\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('---\n\n## 🤖 AI-Generated Summary\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('*Analyzing discussion...*\n\n'))}\n\n"
 
                 # Build summary prompt with full discussion history
-                summary_parts = [f"Summarize this discussion about: {state.topic}\\n\\n"]
-                summary_parts.append(f"Mode: {state.mode}\\n")
-                summary_parts.append(f"Total rounds: {state.current_round}\\n\\n")
-                summary_parts.append("Discussion transcript:\\n")
+                summary_parts = [f"Summarize this discussion about: {state.topic}\n\n"]
+                summary_parts.append(f"Mode: {state.mode}\n")
+                summary_parts.append(f"Total rounds: {state.current_round}\n\n")
+                summary_parts.append("Discussion transcript:\n")
 
                 for entry in state.discussion_history:
                     model_name = state.get_model_name(entry["model"])
@@ -2607,7 +2748,7 @@ Keep it concise (3-5 paragraphs).""")
                     # Truncate very long responses for summary prompt
                     if len(response_text) > 1000:
                         response_text = response_text[:1000] + "... [truncated]"
-                    summary_parts.append(f"{model_name}: {response_text}\\n\\n")
+                    summary_parts.append(f"{model_name}: {response_text}\n\n")
 
                 summary_parts.append("""
 Please provide:
@@ -2631,16 +2772,16 @@ Keep it concise (3-5 paragraphs).""")
                         trace=trace,
                     )
 
-                    yield f"data: {json.dumps(make_chunk(summary_response))}\\n\\n"
+                    yield f"data: {json.dumps(make_chunk(summary_response))}\n\n"
                 except Exception as e:
-                    yield f"data: {json.dumps(make_chunk(f'*Summary generation failed: {str(e)}*'))}\\n\\n"
+                    yield f"data: {json.dumps(make_chunk(f'*Summary generation failed: {str(e)}*'))}\n\n"
 
-                yield f"data: {json.dumps(make_chunk('\\n---\\n\\n*Export complete. Discussion ended.*\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('\n---\n\n*Export complete. Discussion ended.*\n\n'))}\n\n"
                 clear_discussion_state(chat_id)
             else:
                 # Unexpected input in SYNTHESIS stage
                 logger.warning(f"[{trace}] synthesis.unexpected | chat_id={chat_id} input='{user_command}' expected='export'")
-                yield f"data: {json.dumps(make_chunk(f'**Invalid command in synthesis stage:** "{user_command}"\\n\\nPlease type exactly **\"export\"** to generate summary.\\n\\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Invalid command in synthesis stage:** "{user_command}"\n\nPlease type exactly **\"export\"** to generate summary.\n\n'))}\n\n"
 
     except Exception as e:
         error_msg = f"Discussion error: {str(e)}"
