@@ -2222,6 +2222,7 @@ class DiscussionStage(Enum):
     DISCUSSION = "discussion"  # Multi-round interactive stage
     ROUND1 = "round1"
     SYNTHESIS = "synthesis"
+    CONSENSUS = "consensus"  # Agree on what to implement
     IMPLEMENTATION = "implementation"  # Code implementation mode
     COMPLETE = "complete"
 
@@ -2238,6 +2239,7 @@ class DiscussionState:
     discussion_history: List[Dict[str, str]] = None
     waiting_for_user: bool = False
     # Implementation mode fields
+    consensus_proposal: str = ""  # What models think should be implemented
     implementation_plan: str = ""
     implementation_code: Dict[str, str] = None  # filename -> code content
     implementation_approved: bool = False
@@ -2824,80 +2826,56 @@ Keep it concise (3-5 paragraphs).""")
                 clear_discussion_state(chat_id)
 
             elif user_command == "implement" or user_input.lower().startswith("implement:"):
-                # User wants to implement a feature
-                if user_command == "implement":
-                    # User just typed "implement" - use the last follow-up or discussion topic as context
-                    feature_description = "the idea discussed above"
-                    logger.info(f"[{trace}] implementation.start | chat_id={chat_id} feature='from_context'")
-                else:
-                    feature_description = user_input[10:].strip()  # Remove "implement:" prefix
-                    logger.info(f"[{trace}] implementation.start | chat_id={chat_id} feature='{feature_description}'")
+                # User wants to implement - first establish consensus
+                logger.info(f"[{trace}] consensus.start | chat_id={chat_id}")
 
-                state.stage = DiscussionStage.IMPLEMENTATION
-                state.implementation_plan = ""
-                state.implementation_code = {}
-                state.implementation_approved = False
+                state.stage = DiscussionStage.CONSENSUS
+                state.consensus_proposal = ""
                 set_discussion_state(state)
 
-                yield f"data: {json.dumps(make_chunk(f'🔧 **Implementation Mode**\n\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk(f'**Feature:** {feature_description}\n\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('**Stage:** Planning\n\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('Models are discussing how to implement this feature...\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'🤝 **Building Consensus**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('**Stage:** Identifying what to implement\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('Models are reviewing the discussion to propose what should be built...\n\n'))}\n\n"
 
-                # Both models collaborate on implementation plan
+                # Both models propose what they think should be implemented
                 for i, model in enumerate(state.models):
                     model_name = state.get_model_name(model)
                     icon = "🔵" if i == 0 else "🟡"
 
-                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} planning...**\n\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} proposing...**\n\n'))}\n\n"
 
-                    # Create planning prompt with context from discussion if available
-                    context_info = ""
-                    if feature_description == "the idea discussed above" and state.discussion_history:
-                        # Include recent discussion context
-                        recent_entries = state.discussion_history[-4:]  # Last 4 entries
-                        context_parts = ["Recent discussion context:\n"]
-                        for entry in recent_entries:
-                            model_name = state.get_model_name(entry["model"])
-                            response = entry["response"][:300]  # First 300 chars
-                            context_parts.append(f"{model_name}: {response}...\n")
-                        context_info = "\n".join(context_parts) + "\n"
-
-                    # Detect project path from discussion context
-                    project_path_hint = ""
+                    # Build context from recent discussion
+                    context_parts = []
                     if state.discussion_history:
-                        for entry in state.discussion_history:
-                            response = entry["response"]
-                            # Look for paths mentioned in discussion
-                            if "/home/jay/projects/" in response:
-                                import re
-                                paths = re.findall(r'/home/jay/projects/[^\s]+', response)
-                                if paths:
-                                    project_path_hint = f"\nIMPORTANT: The project is located in: {paths[0]}\nAll file paths should be relative to this project directory.\n"
-                                    break
+                        context_parts.append("Recent discussion:\n")
+                        for entry in state.discussion_history[-6:]:  # Last 6 entries
+                            entry_model = state.get_model_name(entry["model"])
+                            response = entry["response"][:400]  # First 400 chars
+                            context_parts.append(f"{entry_model}: {response}...\n")
+                    context_info = "\n".join(context_parts)
 
-                    planning_prompt = f"""{context_info}You are helping implement this feature: "{feature_description}"{project_path_hint}
+                    consensus_prompt = f"""{context_info}
 
-Your task is to create an implementation plan. Analyze:
-1. What files need to be modified or created (use paths relative to the project directory if mentioned)
-2. What changes are needed in each file
-3. Dependencies or prerequisites
-4. Potential risks or challenges
-5. How to test the implementation
+The user wants to implement something from this discussion. Your task is to:
 
-Be specific about file paths and code changes. Keep the plan practical and implementable.
+1. **Identify** what specific feature/project should be built based on the discussion
+2. **Clarify** any ambiguities (what language? what's the goal? what scope?)
+3. **Propose** a clear, concise statement of what will be implemented
 
-Your implementation plan:"""
+Be specific. If the discussion was vague, ask clarifying questions.
+If multiple options were discussed, state which one makes most sense and why.
 
-                    # Get the other model's plan if available
-                    history_prompt = ""
-                    if i == 1 and state.implementation_plan:
-                        history_prompt = f"\nYour colleague proposed:\n{state.implementation_plan}\n\nNow provide your analysis and suggestions:\n"
-                        planning_prompt = history_prompt + planning_prompt
+Your proposal:"""
+
+                    # Second model sees first model's proposal
+                    if i == 1 and state.consensus_proposal:
+                        consensus_prompt = f"""Your colleague proposed:\n\n{state.consensus_proposal}\n\n{consensus_prompt}
+
+Do you agree? If not, what would you propose instead?"""
 
                     response, session = await call_model_prompt(
                         model_id=model,
-                        prompt=planning_prompt,
+                        prompt=consensus_prompt,
                         session_id=get_session_id(model, chat_id),
                         history_prompt=None,
                         chat_id=chat_id,
@@ -2907,16 +2885,16 @@ Your implementation plan:"""
                     if session:
                         set_session_id(model, chat_id, session)
 
-                    # Store the plan
-                    if not state.implementation_plan:
-                        state.implementation_plan = f"{model_name}:\n{response}\n\n"
+                    # Store the proposal
+                    if not state.consensus_proposal:
+                        state.consensus_proposal = f"{model_name}:\n{response}\n\n"
                     else:
-                        state.implementation_plan += f"{model_name}:\n{response}\n\n"
+                        state.consensus_proposal += f"{model_name}:\n{response}\n\n"
 
                     yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
 
                 set_discussion_state(state)
-                yield f"data: {json.dumps(make_chunk('\n**Plan complete!** Review the plan above.\n\nType **\"approve\"** to proceed with implementation, **\"revise: <feedback>\"** to modify the plan, or **\"cancel\"** to abort.\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('\n**Proposal complete!** Review what the models want to build.\n\nType **\"yes\"** to proceed with planning, **\"no: <clarification>\"** to provide more context, or **\"cancel\"** to abort.\n\n'))}\n\n"
 
             elif user_command == "continue":
                 # Check if we've hit max rounds
@@ -3042,6 +3020,136 @@ Your implementation plan:"""
                 # Offer to continue or stop
                 set_discussion_state(state)
                 yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide guidance, **\"implement\"** to build an idea, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
+
+        elif state.stage == DiscussionStage.CONSENSUS:
+            user_command = user_input.lower().strip()
+            logger.info(f"[{trace}] consensus.command | chat_id={chat_id} cmd={user_command}")
+
+            if user_command == "yes":
+                # User approved the consensus - move to planning
+                logger.info(f"[{trace}] consensus.approved | chat_id={chat_id}")
+                state.stage = DiscussionStage.IMPLEMENTATION
+                state.implementation_plan = ""
+                state.implementation_code = {}
+                state.implementation_approved = False
+                set_discussion_state(state)
+
+                yield f"data: {json.dumps(make_chunk('✅ **Consensus reached!**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('🔧 **Implementation Mode**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('**Stage:** Planning\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('Models are creating a detailed implementation plan...\n\n'))}\n\n"
+
+                # Extract what to implement from consensus
+                feature_description = state.consensus_proposal
+
+                # Detect project path from consensus/discussion
+                project_path_hint = ""
+                combined_text = state.consensus_proposal + "\n" + "\n".join([e["response"] for e in state.discussion_history])
+                if "/home/jay/projects/" in combined_text:
+                    import re
+                    paths = re.findall(r'/home/jay/projects/[^\s]+', combined_text)
+                    if paths:
+                        project_path_hint = f"\nIMPORTANT: The project is located in: {paths[0]}\nAll file paths should be relative to this project directory.\n"
+
+                # Both models create implementation plan
+                for i, model in enumerate(state.models):
+                    model_name = state.get_model_name(model)
+                    icon = "🔵" if i == 0 else "🟡"
+
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} planning...**\n\n'))}\n\n"
+
+                    planning_prompt = f"""Based on this consensus:\n\n{feature_description}{project_path_hint}
+
+Create a detailed implementation plan. Include:
+1. What files need to be created or modified
+2. Specific code changes needed
+3. Dependencies or prerequisites
+4. How to test the implementation
+
+Be concrete and specific about file paths and code.
+
+Your plan:"""
+
+                    if i == 1 and state.implementation_plan:
+                        planning_prompt = f"""Your colleague's plan:\n\n{state.implementation_plan}\n\n{planning_prompt}
+
+Review their plan and add your suggestions."""
+
+                    response, session = await call_model_prompt(
+                        model_id=model,
+                        prompt=planning_prompt,
+                        session_id=get_session_id(model, chat_id),
+                        history_prompt=None,
+                        chat_id=chat_id,
+                        trace=trace,
+                    )
+
+                    if session:
+                        set_session_id(model, chat_id, session)
+
+                    if not state.implementation_plan:
+                        state.implementation_plan = f"{model_name}:\n{response}\n\n"
+                    else:
+                        state.implementation_plan += f"{model_name}:\n{response}\n\n"
+
+                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+
+                set_discussion_state(state)
+                yield f"data: {json.dumps(make_chunk('\n**Plan complete!**\n\nType **\"approve\"** to generate code, **\"revise: <feedback>\"** to modify the plan, or **\"cancel\"** to abort.\n\n'))}\n\n"
+
+            elif user_input.lower().startswith("no:"):
+                # User wants to clarify - provide more context and try again
+                clarification = user_input[3:].strip()
+                logger.info(f"[{trace}] consensus.clarify | chat_id={chat_id} clarification='{clarification[:50]}'")
+
+                yield f"data: {json.dumps(make_chunk(f'📝 **Clarification received:** {clarification}\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('Models are revising their proposal...\n\n'))}\n\n"
+
+                # Have models revise with clarification
+                for i, model in enumerate(state.models):
+                    model_name = state.get_model_name(model)
+                    icon = "🔵" if i == 0 else "🟡"
+
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} revising...**\n\n'))}\n\n"
+
+                    revision_prompt = f"""User clarification: "{clarification}"
+
+Previous proposal:
+{state.consensus_proposal}
+
+Based on this clarification, propose what should be implemented. Be specific.
+
+Your revised proposal:"""
+
+                    response, session = await call_model_prompt(
+                        model_id=model,
+                        prompt=revision_prompt,
+                        session_id=get_session_id(model, chat_id),
+                        history_prompt=None,
+                        chat_id=chat_id,
+                        trace=trace,
+                    )
+
+                    if session:
+                        set_session_id(model, chat_id, session)
+
+                    if i == 0:
+                        state.consensus_proposal = f"{model_name}:\n{response}\n\n"
+                    else:
+                        state.consensus_proposal += f"{model_name}:\n{response}\n\n"
+
+                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+
+                set_discussion_state(state)
+                yield f"data: {json.dumps(make_chunk('\n**Revised proposal complete!**\n\nType **\"yes\"** to proceed, **\"no: <more clarification>\"** to revise again, or **\"cancel\"** to abort.\n\n'))}\n\n"
+
+            elif user_command == "cancel":
+                logger.info(f"[{trace}] consensus.cancelled | chat_id={chat_id}")
+                yield f"data: {json.dumps(make_chunk('❌ **Consensus building cancelled.**\n\n'))}\n\n"
+                clear_discussion_state(chat_id)
+
+            else:
+                yield f"data: {json.dumps(make_chunk(f'**Unknown command:** "{user_command}"\n\nValid commands: **yes**, **no: <clarification>**, **cancel**\n\n'))}\n\n"
 
         elif state.stage == DiscussionStage.IMPLEMENTATION:
             user_command = user_input.lower().strip()
