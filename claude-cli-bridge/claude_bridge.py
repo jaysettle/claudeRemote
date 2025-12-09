@@ -2595,10 +2595,15 @@ Keep it concise (3-5 paragraphs).""")
                 yield f"data: {json.dumps(make_chunk('\n---\n\n*Export complete. Discussion ended.*\n\n'))}\n\n"
                 clear_discussion_state(chat_id)
 
-            elif user_input.lower().startswith("implement:"):
+            elif user_command == "implement" or user_input.lower().startswith("implement:"):
                 # User wants to implement a feature
-                feature_description = user_input[10:].strip()  # Remove "implement:" prefix
-                logger.info(f"[{trace}] implementation.start | chat_id={chat_id} feature='{feature_description}'")
+                if user_command == "implement":
+                    # User just typed "implement" - use the last follow-up or discussion topic as context
+                    feature_description = "the idea discussed above"
+                    logger.info(f"[{trace}] implementation.start | chat_id={chat_id} feature='from_context'")
+                else:
+                    feature_description = user_input[10:].strip()  # Remove "implement:" prefix
+                    logger.info(f"[{trace}] implementation.start | chat_id={chat_id} feature='{feature_description}'")
 
                 state.stage = DiscussionStage.IMPLEMENTATION
                 state.implementation_plan = ""
@@ -2618,8 +2623,19 @@ Keep it concise (3-5 paragraphs).""")
 
                     yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} planning...**\n\n'))}\n\n"
 
-                    # Create planning prompt
-                    planning_prompt = f"""You are helping implement this feature: "{feature_description}"
+                    # Create planning prompt with context from discussion if available
+                    context_info = ""
+                    if feature_description == "the idea discussed above" and state.discussion_history:
+                        # Include recent discussion context
+                        recent_entries = state.discussion_history[-4:]  # Last 4 entries
+                        context_parts = ["Recent discussion context:\n"]
+                        for entry in recent_entries:
+                            model_name = state.get_model_name(entry["model"])
+                            response = entry["response"][:300]  # First 300 chars
+                            context_parts.append(f"{model_name}: {response}...\n")
+                        context_info = "\n".join(context_parts) + "\n"
+
+                    planning_prompt = f"""{context_info}You are helping implement this feature: "{feature_description}"
 
 Your task is to create an implementation plan. Analyze:
 1. What files need to be modified or created
@@ -2784,7 +2800,7 @@ Your implementation plan:"""
 
                 # Offer to continue or stop
                 set_discussion_state(state)
-                yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide guidance, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide guidance, **\"implement\"** to build an idea, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
 
         elif state.stage == DiscussionStage.IMPLEMENTATION:
             user_command = user_input.lower().strip()
