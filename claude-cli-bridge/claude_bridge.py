@@ -19,7 +19,8 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
+import urllib.request
 from enum import Enum
 from dataclasses import dataclass, asdict
 
@@ -65,6 +66,47 @@ GEMINI_CLI_PATH = os.getenv("GEMINI_CLI_PATH", "/usr/local/bin/gemini")
 GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", str(CLAUDE_TIMEOUT)))
 BRIDGE_PORT = int(os.getenv("CLAUDE_BRIDGE_PORT", "8000"))
 CLAUDE_DISABLE_MCP = os.getenv("CLAUDE_DISABLE_MCP", "1") == "1"  # Default: disable MCP to avoid slow startup
+
+# Interactive implementation config
+def _parse_allowed_roots(raw: str) -> List[Path]:
+    roots: List[Path] = []
+    for part in raw.split(os.pathsep):
+        if not part:
+            continue
+        try:
+            roots.append(Path(part).expanduser().resolve())
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Failed to parse allowed root '{part}': {exc}")
+    return roots
+
+ALLOWED_WRITE_ROOTS = _parse_allowed_roots(os.getenv("IMPLEMENTATION_ALLOWED_ROOTS", str(Path.cwd())))
+ALLOWED_WRITE_ROOTS.append(Path(tempfile.gettempdir()).resolve())
+# Deduplicate while preserving order
+_seen_roots = []
+for r in ALLOWED_WRITE_ROOTS:
+    if r not in _seen_roots:
+        _seen_roots.append(r)
+ALLOWED_WRITE_ROOTS = _seen_roots
+
+BLOCKED_PATH_PREFIXES = [
+    Path("/etc"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/usr"),
+    Path("/lib"),
+    Path("/lib64"),
+    Path("/var"),
+    Path("/boot"),
+    Path("/opt"),
+    Path("/root"),
+    Path("/sys"),
+    Path("/proc"),
+    Path("/dev"),
+]
+
+HEALTHCHECK_CMD = os.getenv("IMPLEMENTATION_HEALTHCHECK_CMD", "")
+HEALTHCHECK_URL = os.getenv("IMPLEMENTATION_HEALTHCHECK_URL", "")
+HEALTHCHECK_TIMEOUT = int(os.getenv("IMPLEMENTATION_HEALTHCHECK_TIMEOUT", "15"))
 
 SUPPORTED_MODELS = {
     "claude-cli": {"owned_by": "anthropic"},
@@ -2284,6 +2326,192 @@ def parse_discussion_intent(user_input: str) -> Dict[str, Any]:
     config["topic"] = topic if topic else user_input
     return config
 
+
+# ==========================================================================
+# Implementation safety + rollback helpers
+# ==========================================================================
+
+def is_safe_path(path: Path) -> bool:
+    """Validate target path against whitelist/blacklist rules."""
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception as exc:
+        logger.warning(f"is_safe_path: failed to resolve {path}: {exc}")
+        return False
+
+    for blocked in BLOCKED_PATH_PREFIXES:
+        if resolved == blocked or blocked in resolved.parents:
+            return False
+
+    for root in ALLOWED_WRITE_ROOTS:
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+
+    return False
+
+
+def find_git_root(start: Path) -> Optional[Path]:
+    """Find nearest git root for a path."""
+    try:
+        candidate = start.expanduser().resolve()
+    except Exception:
+        return None
+
+    for parent in [candidate] + list(candidate.parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def create_rollback_commit(repo_root: Path) -> Optional[str]:
+    """Create an empty commit as rollback checkpoint if repo is clean."""
+    if not repo_root or not shutil.which("git"):
+        return None
+
+    def _run_git(args: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True,
+        )
+
+    inside = _run_git(["rev-parse", "--is-inside-work-tree"])
+    if inside.returncode != 0:
+        logger.info(f"Rollback commit skipped: not a git repo at {repo_root}")
+        return None
+
+    status = _run_git(["status", "--porcelain"])
+    if status.returncode != 0:
+        logger.warning(f"Rollback commit status failed: {status.stderr.strip()}")
+        return None
+
+    if status.stdout.strip():
+        logger.info("Rollback commit skipped: working tree dirty")
+        return None
+
+    commit_message = f"Implementation rollback checkpoint {int(time.time())}"
+    commit = _run_git(["commit", "--allow-empty", "-m", commit_message])
+    if commit.returncode != 0:
+        logger.warning(f"Rollback commit failed: {commit.stderr.strip()}")
+        return None
+
+    head = _run_git(["rev-parse", "HEAD"])
+    if head.returncode == 0:
+        return head.stdout.strip()
+
+    logger.warning("Rollback commit created but unable to read HEAD")
+    return None
+
+
+def reset_to_commit(repo_root: Path, commit_hash: str) -> bool:
+    if not repo_root or not commit_hash or not shutil.which("git"):
+        return False
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "reset", "--hard", commit_hash],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.error(f"Git rollback failed: {result.stderr.strip()}")
+            return False
+        return True
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception(f"Git rollback exception: {exc}")
+        return False
+
+
+def backup_file(src: Path, backup_dir: Path) -> Optional[Path]:
+    """Copy src into backup_dir preserving absolute structure."""
+    try:
+        resolved = src.expanduser().resolve()
+        rel = resolved.relative_to(resolved.anchor)
+        dest = backup_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if resolved.exists():
+            shutil.copy2(resolved, dest)
+        return dest
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(f"Failed to back up {src}: {exc}")
+        return None
+
+
+def write_file_with_backup(target: Path, content: str, backup_dir: Path) -> Tuple[Path, bool]:
+    """Write file atomically with backup; returns (path, created)."""
+    resolved = target.expanduser().resolve()
+    created = not resolved.exists()
+    if not created:
+        backup_file(resolved, backup_dir)
+
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="impl_", dir=str(resolved.parent))
+    with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+        tmp.write(content)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+
+    os.replace(tmp_path, resolved)
+    return resolved, created
+
+
+def restore_backups(backup_dir: Path) -> List[Path]:
+    restored: List[Path] = []
+    if not backup_dir.exists():
+        return restored
+
+    for file in backup_dir.rglob("*"):
+        if file.is_file():
+            rel = file.relative_to(backup_dir)
+            target = Path(os.sep) / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, target)
+            restored.append(target)
+    return restored
+
+
+def delete_created_files(paths: List[Path]) -> List[Path]:
+    removed: List[Path] = []
+    for p in paths:
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(p)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Failed to delete {p}: {exc}")
+    return removed
+
+
+def check_service_health() -> Tuple[bool, str]:
+    """Run configured health check command or HTTP probe."""
+    if HEALTHCHECK_CMD:
+        try:
+            result = subprocess.run(
+                HEALTHCHECK_CMD,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=HEALTHCHECK_TIMEOUT,
+            )
+            output = (result.stdout or "").strip() or (result.stderr or "").strip()
+            return result.returncode == 0, output or f"Exit code {result.returncode}"
+        except subprocess.TimeoutExpired:
+            return False, "Health check command timed out"
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, f"Health check command failed: {exc}"
+
+    if HEALTHCHECK_URL:
+        try:
+            with urllib.request.urlopen(HEALTHCHECK_URL, timeout=HEALTHCHECK_TIMEOUT) as resp:
+                return 200 <= resp.status < 300, f"HTTP {resp.status}"
+        except Exception as exc:  # pragma: no cover - defensive
+            return False, f"Health check HTTP failed: {exc}"
+
+    return True, "No health check configured"
+
 def build_discussion_history_prompt(state: DiscussionState) -> str:
     """Build a history prompt with full discussion context for session fallback"""
     history_parts = []
@@ -2635,10 +2863,23 @@ Keep it concise (3-5 paragraphs).""")
                             context_parts.append(f"{model_name}: {response}...\n")
                         context_info = "\n".join(context_parts) + "\n"
 
-                    planning_prompt = f"""{context_info}You are helping implement this feature: "{feature_description}"
+                    # Detect project path from discussion context
+                    project_path_hint = ""
+                    if state.discussion_history:
+                        for entry in state.discussion_history:
+                            response = entry["response"]
+                            # Look for paths mentioned in discussion
+                            if "/home/jay/projects/" in response:
+                                import re
+                                paths = re.findall(r'/home/jay/projects/[^\s]+', response)
+                                if paths:
+                                    project_path_hint = f"\nIMPORTANT: The project is located in: {paths[0]}\nAll file paths should be relative to this project directory.\n"
+                                    break
+
+                    planning_prompt = f"""{context_info}You are helping implement this feature: "{feature_description}"{project_path_hint}
 
 Your task is to create an implementation plan. Analyze:
-1. What files need to be modified or created
+1. What files need to be modified or created (use paths relative to the project directory if mentioned)
 2. What changes are needed in each file
 3. Dependencies or prerequisites
 4. Potential risks or challenges
@@ -2881,23 +3122,80 @@ Your code:"""
                 # Deploy the code changes
                 logger.info(f"[{trace}] implementation.deploy | chat_id={chat_id} files={len(state.implementation_code)}")
 
-                yield f"data: {json.dumps(make_chunk('🚀 **Deploying changes...**\n\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('⚠️ **Safety feature:** This is a prototype. Actual file writing is disabled in this version.\n\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('**In a production version, this would:**\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('1. Create git commit for rollback\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('2. Write code to files\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('3. Restart dev service\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('4. Test service health\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('5. Rollback if errors occur\n\n'))}\n\n"
+                if not state.implementation_code:
+                    yield f"data: {json.dumps(make_chunk('⚠️ No code files captured to deploy. Try **"approve"** again.\n\n'))}\n\n"
+                else:
+                    yield f"data: {json.dumps(make_chunk('🚀 **Deploying changes...**\n\n'))}\n\n"
 
-                # TODO: Actual implementation would go here
-                # For now, just show what would happen
-                for filepath, code in state.implementation_code.items():
-                    yield f"data: {json.dumps(make_chunk(f'\n**Would write to:** {filepath}\n'))}\n\n"
-                    yield f"data: {json.dumps(make_chunk(f'**Code length:** {len(code)} characters\n\n'))}\n\n"
+                    # Pre-flight safety check
+                    unsafe_files = []
+                    resolved_paths: Dict[str, Path] = {}
+                    for filepath in state.implementation_code.keys():
+                        resolved = Path(filepath).expanduser()
+                        resolved_paths[filepath] = resolved
+                        if not is_safe_path(resolved):
+                            unsafe_files.append(str(resolved))
 
-                yield f"data: {json.dumps(make_chunk('\n✅ **Implementation complete (simulation mode)**\n\n'))}\n\n"
-                clear_discussion_state(chat_id)
+                    if unsafe_files:
+                        warning = "\n".join([f"- {p}" for p in unsafe_files])
+                        yield f"data: {json.dumps(make_chunk(f'⛔ Blocked unsafe paths. Adjust the target files and retry:\n{warning}\n\n'))}\n\n"
+                    else:
+                        git_root = None
+                        for resolved in resolved_paths.values():
+                            git_root = find_git_root(resolved)
+                            if git_root:
+                                break
+
+                        rollback_commit = create_rollback_commit(git_root) if git_root else None
+                        state.rollback_commit = rollback_commit or ""
+                        set_discussion_state(state)
+
+                        if rollback_commit:
+                            yield f"data: {json.dumps(make_chunk(f'💾 Rollback checkpoint created at {rollback_commit}\n\n'))}\n\n"
+                        elif git_root:
+                            yield f"data: {json.dumps(make_chunk('⚠️ Git rollback skipped (dirty tree or commit failed). Using file backups only.\n\n'))}\n\n"
+                        else:
+                            yield f"data: {json.dumps(make_chunk('ℹ️ No git repository detected. Using file backups for rollback.\n\n'))}\n\n"
+
+                        backup_dir = Path(tempfile.mkdtemp(prefix="implementation_backup_"))
+                        created_files: List[Path] = []
+                        write_error: Optional[str] = None
+
+                        for filepath, code in state.implementation_code.items():
+                            target = resolved_paths[filepath]
+                            yield f"data: {json.dumps(make_chunk(f'✏️ Writing {target}\n'))}\n\n"
+                            try:
+                                written, created = write_file_with_backup(target, code, backup_dir)
+                                if created:
+                                    created_files.append(written)
+                                yield f"data: {json.dumps(make_chunk(f'✅ Wrote {written}\n'))}\n\n"
+                            except Exception as exc:
+                                write_error = f"Failed to write {target}: {exc}"
+                                logger.exception(write_error)
+                                break
+
+                        if write_error:
+                            yield f"data: {json.dumps(make_chunk('⚠️ Error during write. Rolling back...\n\n'))}\n\n"
+                            restored = restore_backups(backup_dir)
+                            removed = delete_created_files(created_files)
+                            rollback_ok = reset_to_commit(git_root, state.rollback_commit) if state.rollback_commit else False
+                            yield f"data: {json.dumps(make_chunk(f'Rolled back {len(restored)} files; removed {len(removed)} new files. Git rollback: {"ok" if rollback_ok else "skipped"}.\n\n'))}\n\n"
+                            yield f"data: {json.dumps(make_chunk(write_error + '\n\n'))}\n\n"
+                            clear_discussion_state(chat_id)
+                        else:
+                            # Health check after writes
+                            health_ok, health_detail = check_service_health()
+                            if not health_ok:
+                                yield f"data: {json.dumps(make_chunk(f'❌ Health check failed: {health_detail}\nRolling back...\n\n'))}\n\n"
+                                restored = restore_backups(backup_dir)
+                                removed = delete_created_files(created_files)
+                                rollback_ok = reset_to_commit(git_root, state.rollback_commit) if state.rollback_commit else False
+                                yield f"data: {json.dumps(make_chunk(f'Rolled back {len(restored)} files; removed {len(removed)} new files. Git rollback: {"ok" if rollback_ok else "skipped"}.\n\n'))}\n\n"
+                                clear_discussion_state(chat_id)
+                            else:
+                                yield f"data: {json.dumps(make_chunk(f'🩺 Health check passed: {health_detail}\n\n'))}\n\n"
+                                yield f"data: {json.dumps(make_chunk(f'✅ **Implementation complete.** Backups stored at {backup_dir}.\n\n'))}\n\n"
+                                clear_discussion_state(chat_id)
 
             elif user_input.lower().startswith("revise:"):
                 # User wants to revise the plan
