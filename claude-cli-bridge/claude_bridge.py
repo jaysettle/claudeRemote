@@ -2970,7 +2970,7 @@ Do you agree? If not, what would you propose instead?"""
                         state.stage = DiscussionStage.SYNTHESIS
                         yield f"data: {json.dumps(make_chunk(f'\n**Discussion complete ({state.max_rounds} rounds).** Type **\"export\"** for summary.\n\n'))}\n\n"
                     else:
-                        yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
+                        yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide guidance, **\"implement\"** to build an idea, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
             else:
                 # User provided free-form guidance instead of a command
                 user_guidance = user_input  # Use the original input, not lowercased
