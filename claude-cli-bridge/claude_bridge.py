@@ -2180,6 +2180,7 @@ class DiscussionStage(Enum):
     DISCUSSION = "discussion"  # Multi-round interactive stage
     ROUND1 = "round1"
     SYNTHESIS = "synthesis"
+    IMPLEMENTATION = "implementation"  # Code implementation mode
     COMPLETE = "complete"
 
 @dataclass
@@ -2194,6 +2195,11 @@ class DiscussionState:
     model_sessions: Dict[str, Optional[str]] = None
     discussion_history: List[Dict[str, str]] = None
     waiting_for_user: bool = False
+    # Implementation mode fields
+    implementation_plan: str = ""
+    implementation_code: Dict[str, str] = None  # filename -> code content
+    implementation_approved: bool = False
+    rollback_commit: str = ""  # Git commit hash for rollback
 
     def __post_init__(self):
         if self.models is None:
@@ -2202,6 +2208,8 @@ class DiscussionState:
             self.model_sessions = {}
         if self.discussion_history is None:
             self.discussion_history = []
+        if self.implementation_code is None:
+            self.implementation_code = {}
 
     def get_model_name(self, model_id: str) -> str:
         """Get friendly model name"""
@@ -2587,6 +2595,72 @@ Keep it concise (3-5 paragraphs).""")
                 yield f"data: {json.dumps(make_chunk('\n---\n\n*Export complete. Discussion ended.*\n\n'))}\n\n"
                 clear_discussion_state(chat_id)
 
+            elif user_input.lower().startswith("implement:"):
+                # User wants to implement a feature
+                feature_description = user_input[10:].strip()  # Remove "implement:" prefix
+                logger.info(f"[{trace}] implementation.start | chat_id={chat_id} feature='{feature_description}'")
+
+                state.stage = DiscussionStage.IMPLEMENTATION
+                state.implementation_plan = ""
+                state.implementation_code = {}
+                state.implementation_approved = False
+                set_discussion_state(state)
+
+                yield f"data: {json.dumps(make_chunk(f'🔧 **Implementation Mode**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Feature:** {feature_description}\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('**Stage:** Planning\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('Models are discussing how to implement this feature...\n\n'))}\n\n"
+
+                # Both models collaborate on implementation plan
+                for i, model in enumerate(state.models):
+                    model_name = state.get_model_name(model)
+                    icon = "🔵" if i == 0 else "🟡"
+
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} planning...**\n\n'))}\n\n"
+
+                    # Create planning prompt
+                    planning_prompt = f"""You are helping implement this feature: "{feature_description}"
+
+Your task is to create an implementation plan. Analyze:
+1. What files need to be modified or created
+2. What changes are needed in each file
+3. Dependencies or prerequisites
+4. Potential risks or challenges
+5. How to test the implementation
+
+Be specific about file paths and code changes. Keep the plan practical and implementable.
+
+Your implementation plan:"""
+
+                    # Get the other model's plan if available
+                    history_prompt = ""
+                    if i == 1 and state.implementation_plan:
+                        history_prompt = f"\nYour colleague proposed:\n{state.implementation_plan}\n\nNow provide your analysis and suggestions:\n"
+                        planning_prompt = history_prompt + planning_prompt
+
+                    response, session = await call_model_prompt(
+                        model_id=model,
+                        prompt=planning_prompt,
+                        session_id=get_session_id(model, chat_id),
+                        history_prompt=None,
+                        chat_id=chat_id,
+                        trace=trace,
+                    )
+
+                    if session:
+                        set_session_id(model, chat_id, session)
+
+                    # Store the plan
+                    if not state.implementation_plan:
+                        state.implementation_plan = f"{model_name}:\n{response}\n\n"
+                    else:
+                        state.implementation_plan += f"{model_name}:\n{response}\n\n"
+
+                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+
+                set_discussion_state(state)
+                yield f"data: {json.dumps(make_chunk('\n**Plan complete!** Review the plan above.\n\nType **\"approve\"** to proceed with implementation, **\"revise: <feedback>\"** to modify the plan, or **\"cancel\"** to abort.\n\n'))}\n\n"
+
             elif user_command == "continue":
                 # Check if we've hit max rounds
                 if state.current_round >= state.max_rounds:
@@ -2711,6 +2785,159 @@ Keep it concise (3-5 paragraphs).""")
                 # Offer to continue or stop
                 set_discussion_state(state)
                 yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide guidance, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
+
+        elif state.stage == DiscussionStage.IMPLEMENTATION:
+            user_command = user_input.lower().strip()
+            logger.info(f"[{trace}] implementation.command | chat_id={chat_id} cmd={user_command}")
+
+            if user_command == "approve":
+                # User approved the plan, generate code
+                logger.info(f"[{trace}] implementation.approved | chat_id={chat_id}")
+                state.implementation_approved = True
+                set_discussion_state(state)
+
+                yield f"data: {json.dumps(make_chunk('✅ **Plan approved!**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('**Stage:** Code Generation\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('Models are generating code...\n\n'))}\n\n"
+
+                # Both models generate code
+                for i, model in enumerate(state.models):
+                    model_name = state.get_model_name(model)
+                    icon = "🔵" if i == 0 else "🟡"
+
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} coding...**\n\n'))}\n\n"
+
+                    # Create code generation prompt
+                    code_prompt = f"""Based on this implementation plan:
+
+{state.implementation_plan}
+
+Generate the actual code changes. For each file:
+1. Specify the full file path
+2. Show the complete code or the specific changes needed
+
+Format your response as:
+```
+FILE: /path/to/file.py
+[complete file content or clear instructions for changes]
+```
+
+Focus on ONE key file that needs modification. Be precise and complete.
+
+Your code:"""
+
+                    response, session = await call_model_prompt(
+                        model_id=model,
+                        prompt=code_prompt,
+                        session_id=get_session_id(model, chat_id),
+                        history_prompt=None,
+                        chat_id=chat_id,
+                        trace=trace,
+                    )
+
+                    if session:
+                        set_session_id(model, chat_id, session)
+
+                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+
+                    # Try to extract file path and code from response
+                    # Simple pattern matching for FILE: declarations
+                    import re
+                    file_matches = re.findall(r'FILE:\s*(.+?)```(.+?)```', response, re.DOTALL)
+                    for file_path, code_content in file_matches:
+                        file_path = file_path.strip()
+                        code_content = code_content.strip()
+                        state.implementation_code[file_path] = code_content
+                        logger.info(f"[{trace}] implementation.code_extracted | file={file_path} chars={len(code_content)}")
+
+                set_discussion_state(state)
+
+                if state.implementation_code:
+                    yield f"data: {json.dumps(make_chunk(f'\n**Code generation complete!**\n\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'Files to modify: {len(state.implementation_code)}\n\n'))}\n\n"
+                    for filepath in state.implementation_code.keys():
+                        yield f"data: {json.dumps(make_chunk(f'- {filepath}\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk('\n\nType **\"deploy\"** to apply changes, or **\"cancel\"** to abort.\n\n'))}\n\n"
+                else:
+                    yield f"data: {json.dumps(make_chunk('⚠️ **No code files were extracted.** The models may need clearer instructions.\n\nType **\"revise: provide code in FILE: format\"** to try again.\n\n'))}\n\n"
+
+            elif user_command == "deploy":
+                # Deploy the code changes
+                logger.info(f"[{trace}] implementation.deploy | chat_id={chat_id} files={len(state.implementation_code)}")
+
+                yield f"data: {json.dumps(make_chunk('🚀 **Deploying changes...**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('⚠️ **Safety feature:** This is a prototype. Actual file writing is disabled in this version.\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('**In a production version, this would:**\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('1. Create git commit for rollback\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('2. Write code to files\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('3. Restart dev service\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('4. Test service health\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('5. Rollback if errors occur\n\n'))}\n\n"
+
+                # TODO: Actual implementation would go here
+                # For now, just show what would happen
+                for filepath, code in state.implementation_code.items():
+                    yield f"data: {json.dumps(make_chunk(f'\n**Would write to:** {filepath}\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'**Code length:** {len(code)} characters\n\n'))}\n\n"
+
+                yield f"data: {json.dumps(make_chunk('\n✅ **Implementation complete (simulation mode)**\n\n'))}\n\n"
+                clear_discussion_state(chat_id)
+
+            elif user_input.lower().startswith("revise:"):
+                # User wants to revise the plan
+                feedback = user_input[7:].strip()
+                logger.info(f"[{trace}] implementation.revise | chat_id={chat_id} feedback='{feedback[:50]}'")
+
+                yield f"data: {json.dumps(make_chunk(f'🔄 **Revising plan based on feedback...**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk(f'**Feedback:** {feedback}\n\n'))}\n\n"
+
+                # Have models revise the plan
+                for i, model in enumerate(state.models):
+                    model_name = state.get_model_name(model)
+                    icon = "🔵" if i == 0 else "🟡"
+
+                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} revising...**\n\n'))}\n\n"
+
+                    revision_prompt = f"""The user provided this feedback on the implementation plan:
+
+"{feedback}"
+
+Previous plan:
+{state.implementation_plan}
+
+Revise the plan based on this feedback. Address the user's concerns and improve the approach.
+
+Your revised plan:"""
+
+                    response, session = await call_model_prompt(
+                        model_id=model,
+                        prompt=revision_prompt,
+                        session_id=get_session_id(model, chat_id),
+                        history_prompt=None,
+                        chat_id=chat_id,
+                        trace=trace,
+                    )
+
+                    if session:
+                        set_session_id(model, chat_id, session)
+
+                    if i == 0:
+                        state.implementation_plan = f"{model_name}:\n{response}\n\n"
+                    else:
+                        state.implementation_plan += f"{model_name}:\n{response}\n\n"
+
+                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+
+                set_discussion_state(state)
+                yield f"data: {json.dumps(make_chunk('\n**Revised plan complete!**\n\nType **\"approve\"** to proceed, **\"revise: <more feedback>\"** to revise again, or **\"cancel\"** to abort.\n\n'))}\n\n"
+
+            elif user_command == "cancel":
+                logger.info(f"[{trace}] implementation.cancelled | chat_id={chat_id}")
+                yield f"data: {json.dumps(make_chunk('❌ **Implementation cancelled.**\n\n'))}\n\n"
+                clear_discussion_state(chat_id)
+
+            else:
+                yield f"data: {json.dumps(make_chunk(f'**Unknown command:** "{user_command}"\n\nValid commands: **approve**, **revise: <feedback>**, **deploy**, **cancel**\n\n'))}\n\n"
 
         elif state.stage == DiscussionStage.SYNTHESIS:
             user_command = user_input.lower().strip()
