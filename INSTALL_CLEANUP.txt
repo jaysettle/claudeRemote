@@ -1,0 +1,62 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    CLAUDE SESSION CLEANUP - QUICK INSTALL                   ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+Problem: 20+ active Claude API connections from idle sessions
+Solution: Auto-cleanup idle sessions after 2 hours
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║ STEP 1: Run Installation Script                                            ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+cd /home/jay/claude-cli-bridge-dev
+./install_cleanup.sh
+
+Choose option 1 (systemd timer) or option 2 (cron job)
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║ STEP 2: Verify It's Working                                                ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+## If you chose Systemd Timer:
+sudo systemctl status claude-session-cleanup.timer
+sudo systemctl list-timers claude-session-cleanup.timer
+
+## If you chose Cron:
+crontab -l
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║ STEP 3: Test Manually (Optional)                                           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+## Dry run (see what would be cleaned):
+python3 /home/jay/claude-cli-bridge-dev/cleanup_idle_sessions.py --dry-run
+
+## Actually clean up:
+python3 /home/jay/claude-cli-bridge-dev/cleanup_idle_sessions.py
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║ What Happens After Installation                                            ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+✅ Cleanup runs automatically every hour
+✅ Removes session mappings idle > 2 hours
+✅ Keeps active sessions (< 2 hours)
+✅ Safe - sessions can be restored with --resume
+✅ Reduces API connections from 20+ to ~5
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║ Files Created                                                               ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+✓ cleanup_idle_sessions.py  - Main cleanup script
+✓ install_cleanup.sh        - Installation helper
+✓ SESSION_CLEANUP_README.md - Full documentation
+✓ INSTALL_CLEANUP.txt       - This file
+
+╔════════════════════════════════════════════════════════════════════════════╗
+║ For More Info                                                               ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+Read the full documentation:
+cat /home/jay/claude-cli-bridge-dev/SESSION_CLEANUP_README.md
