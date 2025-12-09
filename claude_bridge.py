@@ -2223,7 +2223,11 @@ class DiscussionStage(Enum):
     ROUND1 = "round1"
     SYNTHESIS = "synthesis"
     CONSENSUS = "consensus"  # Agree on what to implement
-    IMPLEMENTATION = "implementation"  # Code implementation mode
+    IMPLEMENTATION = "implementation"  # Planning stage
+    CODE_GEN = "code_gen"  # Claude generates code
+    TEST_GEN = "test_gen"  # Codex generates tests
+    TEST_RUN = "test_run"  # Execute tests and report
+    POST_TEST = "post_test"  # User decides next action
     COMPLETE = "complete"
 
 @dataclass
@@ -2241,13 +2245,18 @@ class DiscussionState:
     # Implementation mode fields
     consensus_proposal: str = ""  # What models think should be implemented
     implementation_plan: str = ""
-    implementation_code: Dict[str, str] = None  # filename -> code content
+    implementation_code: Dict[str, str] = None  # filename -> code content (Claude's)
+    test_code: Dict[str, str] = None  # test filename -> test code (Codex's)
     implementation_approved: bool = False
+    test_results: str = ""  # Test execution output
+    tests_passed: bool = False
     rollback_commit: str = ""  # Git commit hash for rollback
 
     def __post_init__(self):
         if self.models is None:
             self.models = ["claude-cli", "codex-cli"]
+        if self.test_code is None:
+            self.test_code = {}
         if self.model_sessions is None:
             self.model_sessions = {}
         if self.discussion_history is None:
@@ -3156,24 +3165,21 @@ Your revised proposal:"""
             logger.info(f"[{trace}] implementation.command | chat_id={chat_id} cmd={user_command}")
 
             if user_command == "approve":
-                # User approved the plan, generate code
+                # User approved the plan, Claude generates code
                 logger.info(f"[{trace}] implementation.approved | chat_id={chat_id}")
                 state.implementation_approved = True
+                state.stage = DiscussionStage.CODE_GEN
                 set_discussion_state(state)
 
                 yield f"data: {json.dumps(make_chunk('✅ **Plan approved!**\n\n'))}\n\n"
                 yield f"data: {json.dumps(make_chunk('**Stage:** Code Generation\n\n'))}\n\n"
-                yield f"data: {json.dumps(make_chunk('Models are generating code...\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('🔵 **Claude** is writing the implementation...\n\n'))}\n\n"
 
-                # Both models generate code
-                for i, model in enumerate(state.models):
-                    model_name = state.get_model_name(model)
-                    icon = "🔵" if i == 0 else "🟡"
+                # Only Claude generates code
+                model = "claude-cli"
 
-                    yield f"data: {json.dumps(make_chunk(f'{icon} **{model_name} coding...**\n\n'))}\n\n"
-
-                    # Create code generation prompt
-                    code_prompt = f"""Based on this implementation plan:
+                # Create code generation prompt
+                code_prompt = f"""Based on this implementation plan:
 
 {state.implementation_plan}
 
@@ -3187,44 +3193,175 @@ FILE: /path/to/file.py
 [complete file content or clear instructions for changes]
 ```
 
-Focus on ONE key file that needs modification. Be precise and complete.
+Be precise and complete. Include all necessary files.
 
 Your code:"""
 
-                    response, session = await call_model_prompt(
-                        model_id=model,
-                        prompt=code_prompt,
-                        session_id=get_session_id(model, chat_id),
+                response, session = await call_model_prompt(
+                    model_id=model,
+                    prompt=code_prompt,
+                    session_id=get_session_id(model, chat_id),
+                    history_prompt=None,
+                    chat_id=chat_id,
+                    trace=trace,
+                )
+
+                if session:
+                    set_session_id(model, chat_id, session)
+
+                yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+
+                # Extract file path and code from response
+                import re
+                file_matches = re.findall(r'FILE:\s*(.+?)```(.+?)```', response, re.DOTALL)
+                for file_path, code_content in file_matches:
+                    file_path = file_path.strip()
+                    code_content = code_content.strip()
+                    state.implementation_code[file_path] = code_content
+                    logger.info(f"[{trace}] code_gen.extracted | file={file_path} chars={len(code_content)}")
+
+                if not state.implementation_code:
+                    yield f"data: {json.dumps(make_chunk('⚠️ **No code files were extracted.** Claude may need clearer instructions.\n\nType **\"revise: provide code in FILE: format\"** to try again, or **\"cancel\"** to abort.\n\n'))}\n\n"
+                else:
+                    # Move to TEST_GEN stage - Codex writes tests
+                    state.stage = DiscussionStage.TEST_GEN
+                    set_discussion_state(state)
+
+                    yield f"data: {json.dumps(make_chunk(f'\n✅ **Code generation complete!**\n\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'Files created by Claude:\n'))}\n\n"
+                    for filepath in state.implementation_code.keys():
+                        yield f"data: {json.dumps(make_chunk(f'- {filepath}\n'))}\n\n"
+
+                    yield f"data: {json.dumps(make_chunk(f'\n**Stage:** Test Generation\n\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk('🟡 **Codex** is writing tests for the implementation...\n\n'))}\n\n"
+
+                    # Codex generates tests
+                    test_model = "codex-cli"
+
+                    # Build context: show Claude's code to Codex
+                    code_context = "\n\n".join([f"FILE: {fp}\n```\n{code}\n```" for fp, code in state.implementation_code.items()])
+
+                    test_prompt = f"""Claude has implemented this code:
+
+{code_context}
+
+Based on this implementation plan:
+{state.implementation_plan}
+
+Your task: Generate comprehensive tests for this code.
+
+Format your response as:
+```
+FILE: /path/to/test_file.py
+[complete test code]
+```
+
+Include:
+- Unit tests for core functionality
+- Edge cases and error handling
+- Test to verify the basic requirement works
+
+Your tests:"""
+
+                    test_response, test_session = await call_model_prompt(
+                        model_id=test_model,
+                        prompt=test_prompt,
+                        session_id=get_session_id(test_model, chat_id),
                         history_prompt=None,
                         chat_id=chat_id,
                         trace=trace,
                     )
 
-                    if session:
-                        set_session_id(model, chat_id, session)
+                    if test_session:
+                        set_session_id(test_model, chat_id, test_session)
 
-                    yield f"data: {json.dumps(make_chunk(f'{response}\n\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'{test_response}\n\n'))}\n\n"
 
-                    # Try to extract file path and code from response
-                    # Simple pattern matching for FILE: declarations
-                    import re
-                    file_matches = re.findall(r'FILE:\s*(.+?)```(.+?)```', response, re.DOTALL)
-                    for file_path, code_content in file_matches:
-                        file_path = file_path.strip()
-                        code_content = code_content.strip()
-                        state.implementation_code[file_path] = code_content
-                        logger.info(f"[{trace}] implementation.code_extracted | file={file_path} chars={len(code_content)}")
+                    # Extract test files
+                    test_matches = re.findall(r'FILE:\s*(.+?)```(.+?)```', test_response, re.DOTALL)
+                    for test_path, test_content in test_matches:
+                        test_path = test_path.strip()
+                        test_content = test_content.strip()
+                        state.test_code[test_path] = test_content
+                        logger.info(f"[{trace}] test_gen.extracted | file={test_path} chars={len(test_content)}")
 
-                set_discussion_state(state)
+                    if not state.test_code:
+                        yield f"data: {json.dumps(make_chunk('\n⚠️ **No test files were extracted.** Proceeding without tests.\n\n'))}\n\n"
+                        yield f"data: {json.dumps(make_chunk('Type **\"deploy\"** to apply changes without tests, or **\"cancel\"** to abort.\n\n'))}\n\n"
+                    else:
+                        yield f"data: {json.dumps(make_chunk(f'\n✅ **Test generation complete!**\n\n'))}\n\n"
+                        yield f"data: {json.dumps(make_chunk(f'Test files created by Codex:\n'))}\n\n"
+                        for test_path in state.test_code.keys():
+                            yield f"data: {json.dumps(make_chunk(f'- {test_path}\n'))}\n\n"
 
-                if state.implementation_code:
-                    yield f"data: {json.dumps(make_chunk(f'\n**Code generation complete!**\n\n'))}\n\n"
-                    yield f"data: {json.dumps(make_chunk(f'Files to modify: {len(state.implementation_code)}\n\n'))}\n\n"
-                    for filepath in state.implementation_code.keys():
-                        yield f"data: {json.dumps(make_chunk(f'- {filepath}\n'))}\n\n"
-                    yield f"data: {json.dumps(make_chunk('\n\nType **\"deploy\"** to apply changes, or **\"cancel\"** to abort.\n\n'))}\n\n"
-                else:
-                    yield f"data: {json.dumps(make_chunk('⚠️ **No code files were extracted.** The models may need clearer instructions.\n\nType **\"revise: provide code in FILE: format\"** to try again.\n\n'))}\n\n"
+                        # Move to TEST_RUN stage
+                        state.stage = DiscussionStage.TEST_RUN
+                        set_discussion_state(state)
+
+                        yield f"data: {json.dumps(make_chunk(f'\n**Stage:** Running Tests\n\n'))}\n\n"
+
+                        # Write files temporarily and run tests
+                        import tempfile
+                        from pathlib import Path
+
+                        test_dir = Path(tempfile.mkdtemp(prefix="discussion_test_"))
+                        logger.info(f"[{trace}] test_run.start | test_dir={test_dir}")
+
+                        try:
+                            # Write implementation files
+                            for file_path, code_content in state.implementation_code.items():
+                                target_file = test_dir / Path(file_path).name
+                                target_file.write_text(code_content)
+                                logger.info(f"[{trace}] test_run.write | file={target_file}")
+
+                            # Write test files
+                            for test_path, test_content in state.test_code.items():
+                                target_file = test_dir / Path(test_path).name
+                                target_file.write_text(test_content)
+                                logger.info(f"[{trace}] test_run.write | file={target_file}")
+
+                            # Run pytest
+                            import subprocess
+                            result = subprocess.run(
+                                ["python", "-m", "pytest", "-v", str(test_dir)],
+                                capture_output=True,
+                                text=True,
+                                timeout=30,
+                                cwd=str(test_dir)
+                            )
+
+                            state.test_results = result.stdout + "\n" + result.stderr
+                            state.tests_passed = (result.returncode == 0)
+                            logger.info(f"[{trace}] test_run.complete | passed={state.tests_passed} returncode={result.returncode}")
+
+                            if state.tests_passed:
+                                yield f"data: {json.dumps(make_chunk('✅ **All tests passed!**\n\n'))}\n\n"
+                            else:
+                                yield f"data: {json.dumps(make_chunk('❌ **Tests failed!**\n\n'))}\n\n"
+
+                            yield f"data: {json.dumps(make_chunk(f'```\n{state.test_results}\n```\n\n'))}\n\n"
+
+                        except subprocess.TimeoutExpired:
+                            state.test_results = "Tests timed out after 30 seconds"
+                            state.tests_passed = False
+                            yield f"data: {json.dumps(make_chunk('⏱️ **Tests timed out!**\n\n'))}\n\n"
+                        except Exception as e:
+                            state.test_results = f"Test execution error: {str(e)}"
+                            state.tests_passed = False
+                            yield f"data: {json.dumps(make_chunk(f'⚠️ **Test execution failed:** {str(e)}\n\n'))}\n\n"
+                        finally:
+                            # Clean up test directory
+                            import shutil
+                            shutil.rmtree(test_dir, ignore_errors=True)
+
+                        # Move to POST_TEST stage
+                        state.stage = DiscussionStage.POST_TEST
+                        set_discussion_state(state)
+
+                        if state.tests_passed:
+                            yield f"data: {json.dumps(make_chunk('\n**Ready to deploy!**\n\nType **\"deploy\"** to apply changes, **\"revise: <feedback>\"** to modify code, or **\"cancel\"** to abort.\n\n'))}\n\n"
+                        else:
+                            yield f"data: {json.dumps(make_chunk('\n**Tests failed.**\n\nType **\"fix\"** to have models fix the issues, **\"deploy\"** to deploy anyway (not recommended), **\"revise: <feedback>\"** to provide guidance, or **\"cancel\"** to abort.\n\n'))}\n\n"
 
             elif user_command == "deploy":
                 # Deploy the code changes
@@ -3360,6 +3497,258 @@ Your revised plan:"""
 
             else:
                 yield f"data: {json.dumps(make_chunk(f'**Unknown command:** "{user_command}"\n\nValid commands: **approve**, **revise: <feedback>**, **deploy**, **cancel**\n\n'))}\n\n"
+
+        elif state.stage == DiscussionStage.POST_TEST:
+            user_command = user_input.lower().strip()
+            logger.info(f"[{trace}] post_test.command | chat_id={chat_id} cmd={user_command} passed={state.tests_passed}")
+
+            if user_command == "deploy":
+                # User wants to deploy (either tests passed or deploying despite failures)
+                logger.info(f"[{trace}] post_test.deploy | chat_id={chat_id} files={len(state.implementation_code)} passed={state.tests_passed}")
+
+                if not state.tests_passed:
+                    logger.warning(f"[{trace}] post_test.deploy_despite_failure | chat_id={chat_id}")
+                    yield f"data: {json.dumps(make_chunk('⚠️ **Deploying despite test failures...**\n\n'))}\n\n"
+
+                if not state.implementation_code:
+                    yield f"data: {json.dumps(make_chunk('⚠️ No code files to deploy.\n\n'))}\n\n"
+                else:
+                    yield f"data: {json.dumps(make_chunk('🚀 **Deploying changes...**\n\n'))}\n\n"
+
+                    # Pre-flight safety check
+                    from pathlib import Path
+                    import tempfile
+                    from typing import Dict, List, Optional
+
+                    unsafe_files = []
+                    resolved_paths: Dict[str, Path] = {}
+                    for filepath in state.implementation_code.keys():
+                        resolved = Path(filepath).expanduser()
+                        resolved_paths[filepath] = resolved
+                        if not is_safe_path(resolved):
+                            unsafe_files.append(str(resolved))
+
+                    if unsafe_files:
+                        warning = "\n".join([f"- {p}" for p in unsafe_files])
+                        yield f"data: {json.dumps(make_chunk(f'⛔ Blocked unsafe paths:\n{warning}\n\n'))}\n\n"
+                    else:
+                        git_root = None
+                        for resolved in resolved_paths.values():
+                            git_root = find_git_root(resolved)
+                            if git_root:
+                                break
+
+                        rollback_commit = create_rollback_commit(git_root) if git_root else None
+                        state.rollback_commit = rollback_commit or ""
+                        set_discussion_state(state)
+
+                        if rollback_commit:
+                            yield f"data: {json.dumps(make_chunk(f'💾 Rollback checkpoint: {rollback_commit}\n\n'))}\n\n"
+                        elif git_root:
+                            yield f"data: {json.dumps(make_chunk('⚠️ Git rollback skipped (dirty tree). Using file backups only.\n\n'))}\n\n"
+                        else:
+                            yield f"data: {json.dumps(make_chunk('ℹ️ No git repository detected. Using file backups.\n\n'))}\n\n"
+
+                        backup_dir = Path(tempfile.mkdtemp(prefix="implementation_backup_"))
+                        created_files: List[Path] = []
+                        write_error: Optional[str] = None
+
+                        for filepath, code in state.implementation_code.items():
+                            target = resolved_paths[filepath]
+                            yield f"data: {json.dumps(make_chunk(f'✏️ Writing {target}\n'))}\n\n"
+                            try:
+                                written, created = write_file_with_backup(target, code, backup_dir)
+                                if created:
+                                    created_files.append(written)
+                                yield f"data: {json.dumps(make_chunk(f'✅ Wrote {written}\n'))}\n\n"
+                            except Exception as exc:
+                                write_error = f"Failed to write {target}: {exc}"
+                                logger.exception(write_error)
+                                break
+
+                        if write_error:
+                            yield f"data: {json.dumps(make_chunk('⚠️ Error during write. Rolling back...\n\n'))}\n\n"
+                            restored = restore_backups(backup_dir)
+                            removed = delete_created_files(created_files)
+                            rollback_ok = reset_to_commit(git_root, state.rollback_commit) if state.rollback_commit else False
+                            yield f"data: {json.dumps(make_chunk(f'Rolled back {len(restored)} files; removed {len(removed)} new files. Git rollback: {"ok" if rollback_ok else "skipped"}.\n\n'))}\n\n"
+                            yield f"data: {json.dumps(make_chunk(write_error + '\n\n'))}\n\n"
+                            clear_discussion_state(chat_id)
+                        else:
+                            # Health check after writes
+                            health_ok, health_detail = check_service_health()
+                            if not health_ok:
+                                yield f"data: {json.dumps(make_chunk(f'❌ Health check failed: {health_detail}\nRolling back...\n\n'))}\n\n"
+                                restored = restore_backups(backup_dir)
+                                removed = delete_created_files(created_files)
+                                rollback_ok = reset_to_commit(git_root, state.rollback_commit) if state.rollback_commit else False
+                                yield f"data: {json.dumps(make_chunk(f'Rolled back {len(restored)} files; removed {len(removed)} new files. Git rollback: {"ok" if rollback_ok else "skipped"}.\n\n'))}\n\n"
+                                clear_discussion_state(chat_id)
+                            else:
+                                yield f"data: {json.dumps(make_chunk(f'🩺 Health check passed: {health_detail}\n\n'))}\n\n"
+
+                                if state.tests_passed:
+                                    yield f"data: {json.dumps(make_chunk(f'✅ **Implementation complete!** All tests passed. Backups at {backup_dir}.\n\n'))}\n\n"
+                                else:
+                                    yield f"data: {json.dumps(make_chunk(f'✅ **Implementation complete** (deployed despite test failures). Backups at {backup_dir}.\n\n'))}\n\n"
+
+                                clear_discussion_state(chat_id)
+
+            elif user_command == "fix":
+                # Models attempt to fix test failures
+                logger.info(f"[{trace}] post_test.fix | chat_id={chat_id}")
+                yield f"data: {json.dumps(make_chunk('🔧 **Attempting to fix test failures...**\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('🔵 **Claude** analyzing failures...\n\n'))}\n\n"
+
+                fix_prompt = f"""The implementation has test failures:
+
+Test Results:
+```
+{state.test_results}
+```
+
+Your original code:
+{chr(10).join([f"FILE: {fp}{chr(10)}```{chr(10)}{code}{chr(10)}```" for fp, code in state.implementation_code.items()])}
+
+Fix the code to pass the tests. Provide corrected code in the same FILE: format.
+
+Your fixed code:"""
+
+                fix_response, fix_session = await call_model_prompt(
+                    model_id="claude-cli",
+                    prompt=fix_prompt,
+                    session_id=get_session_id("claude-cli", chat_id),
+                    history_prompt=None,
+                    chat_id=chat_id,
+                    trace=trace,
+                )
+
+                if fix_session:
+                    set_session_id("claude-cli", chat_id, fix_session)
+
+                yield f"data: {json.dumps(make_chunk(f'{fix_response}\n\n'))}\n\n"
+
+                # Extract fixed code
+                import re
+                fix_matches = re.findall(r'FILE:\s*(.+?)```(.+?)```', fix_response, re.DOTALL)
+                if fix_matches:
+                    for file_path, code_content in fix_matches:
+                        file_path = file_path.strip()
+                        code_content = code_content.strip()
+                        state.implementation_code[file_path] = code_content
+                        logger.info(f"[{trace}] post_test.fix_extracted | file={file_path} chars={len(code_content)}")
+
+                    # Re-run tests with fixed code
+                    yield f"data: {json.dumps(make_chunk('\n🔄 **Re-running tests with fixes...**\n\n'))}\n\n"
+
+                    import tempfile
+                    from pathlib import Path
+                    import shutil
+
+                    test_dir = Path(tempfile.mkdtemp(prefix="discussion_test_retry_"))
+
+                    try:
+                        # Write fixed implementation files
+                        for file_path, code_content in state.implementation_code.items():
+                            target_file = test_dir / Path(file_path).name
+                            target_file.write_text(code_content)
+
+                        # Write test files
+                        for test_path, test_content in state.test_code.items():
+                            target_file = test_dir / Path(test_path).name
+                            target_file.write_text(test_content)
+
+                        # Run pytest again
+                        import subprocess
+                        result = subprocess.run(
+                            ["python", "-m", "pytest", "-v", str(test_dir)],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            cwd=str(test_dir)
+                        )
+
+                        state.test_results = result.stdout + "\n" + result.stderr
+                        state.tests_passed = (result.returncode == 0)
+
+                        if state.tests_passed:
+                            yield f"data: {json.dumps(make_chunk('✅ **Tests now pass!**\n\n'))}\n\n"
+                            yield f"data: {json.dumps(make_chunk(f'```\n{state.test_results}\n```\n\n'))}\n\n"
+                            yield f"data: {json.dumps(make_chunk('\nType **\"deploy\"** to apply changes, or **\"cancel\"** to abort.\n\n'))}\n\n"
+                        else:
+                            yield f"data: {json.dumps(make_chunk('❌ **Tests still failing.**\n\n'))}\n\n"
+                            yield f"data: {json.dumps(make_chunk(f'```\n{state.test_results}\n```\n\n'))}\n\n"
+                            yield f"data: {json.dumps(make_chunk('\nType **\"fix\"** to try again, **\"revise: <guidance>\"** for custom fixes, **\"deploy\"** to deploy anyway, or **\"cancel\"** to abort.\n\n'))}\n\n"
+
+                    except Exception as e:
+                        yield f"data: {json.dumps(make_chunk(f'⚠️ **Fix test failed:** {str(e)}\n\n'))}\n\n"
+                    finally:
+                        shutil.rmtree(test_dir, ignore_errors=True)
+
+                    set_discussion_state(state)
+                else:
+                    yield f"data: {json.dumps(make_chunk('⚠️ **No fixed code extracted.** Try **\"revise: <specific guidance>\"** instead.\n\n'))}\n\n"
+
+            elif user_input.lower().startswith("revise:"):
+                # User provides custom guidance for fixes
+                feedback = user_input[7:].strip()
+                logger.info(f"[{trace}] post_test.revise | chat_id={chat_id} feedback='{feedback[:50]}'")
+
+                yield f"data: {json.dumps(make_chunk(f'📝 **Custom revision:** {feedback}\n\n'))}\n\n"
+                yield f"data: {json.dumps(make_chunk('🔵 **Claude** revising based on feedback...\n\n'))}\n\n"
+
+                revise_prompt = f"""User feedback: "{feedback}"
+
+Test Results:
+```
+{state.test_results}
+```
+
+Current code:
+{chr(10).join([f"FILE: {fp}{chr(10)}```{chr(10)}{code}{chr(10)}```" for fp, code in state.implementation_code.items()])}
+
+Revise the code according to user feedback. Provide updated code in FILE: format.
+
+Your revised code:"""
+
+                revise_response, revise_session = await call_model_prompt(
+                    model_id="claude-cli",
+                    prompt=revise_prompt,
+                    session_id=get_session_id("claude-cli", chat_id),
+                    history_prompt=None,
+                    chat_id=chat_id,
+                    trace=trace,
+                )
+
+                if revise_session:
+                    set_session_id("claude-cli", chat_id, revise_session)
+
+                yield f"data: {json.dumps(make_chunk(f'{revise_response}\n\n'))}\n\n"
+
+                # Extract revised code (same logic as fix)
+                import re
+                revise_matches = re.findall(r'FILE:\s*(.+?)```(.+?)```', revise_response, re.DOTALL)
+                if revise_matches:
+                    for file_path, code_content in revise_matches:
+                        file_path = file_path.strip()
+                        code_content = code_content.strip()
+                        state.implementation_code[file_path] = code_content
+
+                    set_discussion_state(state)
+                    yield f"data: {json.dumps(make_chunk('\n**Revision complete.** Type **\"deploy\"** to apply changes, or **\"cancel\"** to abort.\n\n'))}\n\n"
+                else:
+                    yield f"data: {json.dumps(make_chunk('⚠️ **No revised code extracted.**\n\n'))}\n\n"
+
+            elif user_command == "cancel":
+                logger.info(f"[{trace}] post_test.cancelled | chat_id={chat_id}")
+                yield f"data: {json.dumps(make_chunk('❌ **Implementation cancelled.**\n\n'))}\n\n"
+                clear_discussion_state(chat_id)
+
+            else:
+                if state.tests_passed:
+                    yield f"data: {json.dumps(make_chunk(f'**Unknown command:** "{user_command}"\n\nValid commands: **deploy**, **revise: <feedback>**, **cancel**\n\n'))}\n\n"
+                else:
+                    yield f"data: {json.dumps(make_chunk(f'**Unknown command:** "{user_command}"\n\nValid commands: **fix**, **deploy**, **revise: <feedback>**, **cancel**\n\n'))}\n\n"
 
         elif state.stage == DiscussionStage.SYNTHESIS:
             user_command = user_input.lower().strip()
