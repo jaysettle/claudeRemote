@@ -2742,7 +2742,7 @@ async def stream_interactive_discussion(
                 set_discussion_state(state)
 
                 if state.max_rounds > 1:
-                    yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide your own guidance/question, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
+                    yield f"data: {json.dumps(make_chunk(f'\n**Round {state.current_round} complete.** Type **\"continue\"** for round {state.current_round + 1}, provide your own guidance/question, **\"implement\"** to build an idea, **\"export\"** for summary, or **\"stop\"** to end.\n\n'))}\n\n"
                 else:
                     state.stage = DiscussionStage.SYNTHESIS
                     set_discussion_state(state)
